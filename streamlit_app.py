@@ -8,10 +8,13 @@ Ejecutar con:
     uv run streamlit run streamlit_app.py
 """
 
+import time
+
 import streamlit as st
 
 from app.config import settings
-from app.services.llm_service import stream_estimation
+from app.context.examples import ESTIMATION_EXAMPLES
+from app.services.llm_service import build_system_prompt, stream_estimation
 
 st.set_page_config(page_title="Estimador CAG", page_icon="🧮")
 
@@ -45,7 +48,9 @@ if transcription:
         try:
             # st.write_stream consume el generador y va pintando cada delta;
             # devuelve el texto completo al terminar.
+            start = time.perf_counter()
             estimation = st.write_stream(stream_estimation(transcription, usage))
+            elapsed = time.perf_counter() - start
         except ValueError as exc:
             # Proveedor LLM no soportado u otro error de validación.
             error = f"⚠️ {exc}"
@@ -60,18 +65,50 @@ if transcription:
             st.session_state.messages.append({"role": "assistant", "content": error})
         else:
             if usage:
-                st.caption(
-                    f"Proveedor: `{usage['provider']}` · Modelo: `{usage['model']}` · "
-                    f"Tokens: {usage['used_tokens']}"
-                )
+                # Métricas de la última llamada (visibles en el panel lateral).
+                st.session_state.last_metrics = {**usage, "elapsed": elapsed}
             st.session_state.messages.append(
                 {"role": "assistant", "content": estimation}
             )
 
 with st.sidebar:
-    st.subheader("Configuración")
+    st.subheader("⚙️ Configuración")
     st.write(f"**Proveedor:** `{settings.llm_provider}`")
     st.write(f"**Modelo:** `{settings.resolved_model}`")
+
+    # --- Métricas de la última llamada ---
+    st.subheader("📊 Última llamada")
+    metrics = st.session_state.get("last_metrics")
+    if metrics:
+        st.write(f"**Modelo:** `{metrics['model']}`")
+        col_in, col_out = st.columns(2)
+        col_in.metric("Tokens entrada", metrics["input_tokens"])
+        col_out.metric("Tokens salida", metrics["output_tokens"])
+        st.metric("Tiempo de respuesta", f"{metrics['elapsed']:.2f} s")
+    else:
+        st.caption("Aún no hay llamadas en esta sesión.")
+
+    # --- Contexto CAG inyectado en el system prompt ---
+    st.subheader("🧠 Contexto CAG")
+
+    with st.expander("System prompt activo (solo lectura)"):
+        st.text_area(
+            "System prompt",
+            value=build_system_prompt(),
+            height=300,
+            disabled=True,
+            label_visibility="collapsed",
+        )
+
+    with st.expander(f"Estimaciones de ejemplo ({len(ESTIMATION_EXAMPLES)})"):
+        for index, example in enumerate(ESTIMATION_EXAMPLES, start=1):
+            st.markdown(f"**Ejemplo {index} — resumen de la reunión:**")
+            st.caption(example["meeting_summary"])
+            st.markdown("**Estimación generada:**")
+            st.code(example["estimation"].strip(), language="markdown")
+
+    st.divider()
     if st.button("Limpiar conversación"):
         st.session_state.messages = []
+        st.session_state.pop("last_metrics", None)
         st.rerun()

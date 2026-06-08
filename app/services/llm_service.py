@@ -105,9 +105,13 @@ def _stream_openai(
         if chunk.choices and chunk.choices[0].delta.content:
             yield chunk.choices[0].delta.content
         if chunk.usage and usage_out is not None:
+            usage_out["input_tokens"] = chunk.usage.prompt_tokens
+            usage_out["output_tokens"] = chunk.usage.completion_tokens
             usage_out["used_tokens"] = chunk.usage.total_tokens
 
     if usage_out is not None:
+        usage_out.setdefault("input_tokens", 0)
+        usage_out.setdefault("output_tokens", 0)
         usage_out.setdefault("used_tokens", 0)
         usage_out["model"] = settings.resolved_model
         usage_out["provider"] = "openai"
@@ -129,6 +133,8 @@ def _stream_anthropic(
         final_message = stream.get_final_message()
 
     if usage_out is not None:
+        usage_out["input_tokens"] = final_message.usage.input_tokens
+        usage_out["output_tokens"] = final_message.usage.output_tokens
         usage_out["used_tokens"] = (
             final_message.usage.input_tokens + final_message.usage.output_tokens
         )
