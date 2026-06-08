@@ -89,7 +89,7 @@ def _call_anthropic(system_prompt: str, transcription: str) -> EstimationResult:
 
 
 def _stream_openai(
-    system_prompt: str, transcription: str, usage_out: dict | None
+    system_prompt: str, transcription: str, usage_out: dict | None, max_tokens: int
 ) -> Iterator[str]:
     client = OpenAI(api_key=settings.openai_api_key)
     stream = client.chat.completions.create(
@@ -98,6 +98,7 @@ def _stream_openai(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": transcription},
         ],
+        max_tokens=max_tokens,
         stream=True,
         stream_options={"include_usage": True},
     )
@@ -118,12 +119,12 @@ def _stream_openai(
 
 
 def _stream_anthropic(
-    system_prompt: str, transcription: str, usage_out: dict | None
+    system_prompt: str, transcription: str, usage_out: dict | None, max_tokens: int
 ) -> Iterator[str]:
     client = Anthropic(api_key=settings.anthropic_api_key)
     with client.messages.stream(
         model=settings.resolved_model,
-        max_tokens=4096,
+        max_tokens=max_tokens,
         system=system_prompt,
         messages=[
             {"role": "user", "content": transcription},
@@ -143,22 +144,24 @@ def _stream_anthropic(
 
 
 def stream_estimation(
-    transcription: str, usage_out: dict | None = None
+    transcription: str, usage_out: dict | None = None, max_tokens: int = 4096
 ) -> Iterator[str]:
     """
     Igual que `generate_estimation` pero devuelve la estimación token a token.
 
-    Usa el mismo system prompt (CAG) y dispatch de proveedor. Si se pasa
-    `usage_out`, se rellena con `provider`, `model` y `used_tokens` una vez
-    terminado el stream.
+    Usa el mismo system prompt (CAG) y dispatch de proveedor. `max_tokens` fija
+    el límite de tokens de salida. Si se pasa `usage_out`, se rellena con
+    `provider`, `model` y los tokens de entrada/salida una vez terminado el stream.
     """
     system_prompt = build_system_prompt()
     provider = settings.llm_provider.lower()
 
     if provider == "openai":
-        yield from _stream_openai(system_prompt, transcription, usage_out)
+        yield from _stream_openai(system_prompt, transcription, usage_out, max_tokens)
     elif provider == "anthropic":
-        yield from _stream_anthropic(system_prompt, transcription, usage_out)
+        yield from _stream_anthropic(
+            system_prompt, transcription, usage_out, max_tokens
+        )
     else:
         raise ValueError(
             f"Proveedor LLM no soportado: '{settings.llm_provider}'. "

@@ -48,8 +48,13 @@ if transcription:
         try:
             # st.write_stream consume el generador y va pintando cada delta;
             # devuelve el texto completo al terminar.
+            # El slider del panel lateral fija el límite de tokens de salida;
+            # su valor persiste en session_state entre re-renders.
+            max_tokens = st.session_state.get("max_tokens", 4096)
             start = time.perf_counter()
-            estimation = st.write_stream(stream_estimation(transcription, usage))
+            estimation = st.write_stream(
+                stream_estimation(transcription, usage, max_tokens=max_tokens)
+            )
             elapsed = time.perf_counter() - start
         except ValueError as exc:
             # Proveedor LLM no soportado u otro error de validación.
@@ -75,6 +80,15 @@ with st.sidebar:
     st.subheader("⚙️ Configuración")
     st.write(f"**Proveedor:** `{settings.llm_provider}`")
     st.write(f"**Modelo:** `{settings.resolved_model}`")
+    st.slider(
+        "Tokens de salida (máx.)",
+        min_value=512,
+        max_value=8192,
+        value=4096,
+        step=512,
+        key="max_tokens",
+        help="Límite de tokens que el modelo puede generar en la respuesta.",
+    )
 
     # --- Métricas de la última llamada ---
     st.subheader("📊 Última llamada")
