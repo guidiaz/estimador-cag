@@ -11,7 +11,7 @@ Ejecutar con:
 import streamlit as st
 
 from app.config import settings
-from app.services.llm_service import generate_estimation
+from app.services.llm_service import stream_estimation
 
 st.set_page_config(page_title="Estimador CAG", page_icon="🧮")
 
@@ -39,36 +39,34 @@ if transcription:
     with st.chat_message("user"):
         st.markdown(transcription)
 
-    # Respuesta del asistente.
+    # Respuesta del asistente: se escribe token a token (streaming).
     with st.chat_message("assistant"):
-        with st.spinner("Generando estimación..."):
-            try:
-                result = generate_estimation(transcription)
-            except ValueError as exc:
-                # Proveedor LLM no soportado u otro error de validación.
-                error = f"⚠️ {exc}"
-                st.error(error)
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": error}
-                )
-            except Exception as exc:  # noqa: BLE001 - mostrar cualquier fallo del proveedor
-                error = (
-                    f"⚠️ Error al generar la estimación: {exc}\n\n"
-                    "Revisa que la API key y el proveedor estén configurados en `.env`."
-                )
-                st.error(error)
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": error}
-                )
-            else:
-                st.markdown(result.estimation)
+        usage: dict = {}
+        try:
+            # st.write_stream consume el generador y va pintando cada delta;
+            # devuelve el texto completo al terminar.
+            estimation = st.write_stream(stream_estimation(transcription, usage))
+        except ValueError as exc:
+            # Proveedor LLM no soportado u otro error de validación.
+            error = f"⚠️ {exc}"
+            st.error(error)
+            st.session_state.messages.append({"role": "assistant", "content": error})
+        except Exception as exc:  # noqa: BLE001 - mostrar cualquier fallo del proveedor
+            error = (
+                f"⚠️ Error al generar la estimación: {exc}\n\n"
+                "Revisa que la API key y el proveedor estén configurados en `.env`."
+            )
+            st.error(error)
+            st.session_state.messages.append({"role": "assistant", "content": error})
+        else:
+            if usage:
                 st.caption(
-                    f"Proveedor: `{result.provider}` · Modelo: `{result.model}` · "
-                    f"Tokens: {result.used_tokens}"
+                    f"Proveedor: `{usage['provider']}` · Modelo: `{usage['model']}` · "
+                    f"Tokens: {usage['used_tokens']}"
                 )
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": result.estimation}
-                )
+            st.session_state.messages.append(
+                {"role": "assistant", "content": estimation}
+            )
 
 with st.sidebar:
     st.subheader("Configuración")

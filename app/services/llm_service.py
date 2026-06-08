@@ -1,3 +1,4 @@
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 from anthropic import Anthropic
@@ -85,6 +86,78 @@ def _call_anthropic(system_prompt: str, transcription: str) -> EstimationResult:
         provider="anthropic",
         used_tokens=used_tokens,
     )
+
+
+def _stream_openai(
+    system_prompt: str, transcription: str, usage_out: dict | None
+) -> Iterator[str]:
+    client = OpenAI(api_key=settings.openai_api_key)
+    stream = client.chat.completions.create(
+        model=settings.resolved_model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": transcription},
+        ],
+        stream=True,
+        stream_options={"include_usage": True},
+    )
+    for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta.content:
+            yield chunk.choices[0].delta.content
+        if chunk.usage and usage_out is not None:
+            usage_out["used_tokens"] = chunk.usage.total_tokens
+
+    if usage_out is not None:
+        usage_out.setdefault("used_tokens", 0)
+        usage_out["model"] = settings.resolved_model
+        usage_out["provider"] = "openai"
+
+
+def _stream_anthropic(
+    system_prompt: str, transcription: str, usage_out: dict | None
+) -> Iterator[str]:
+    client = Anthropic(api_key=settings.anthropic_api_key)
+    with client.messages.stream(
+        model=settings.resolved_model,
+        max_tokens=4096,
+        system=system_prompt,
+        messages=[
+            {"role": "user", "content": transcription},
+        ],
+    ) as stream:
+        yield from stream.text_stream
+        final_message = stream.get_final_message()
+
+    if usage_out is not None:
+        usage_out["used_tokens"] = (
+            final_message.usage.input_tokens + final_message.usage.output_tokens
+        )
+        usage_out["model"] = settings.resolved_model
+        usage_out["provider"] = "anthropic"
+
+
+def stream_estimation(
+    transcription: str, usage_out: dict | None = None
+) -> Iterator[str]:
+    """
+    Igual que `generate_estimation` pero devuelve la estimación token a token.
+
+    Usa el mismo system prompt (CAG) y dispatch de proveedor. Si se pasa
+    `usage_out`, se rellena con `provider`, `model` y `used_tokens` una vez
+    terminado el stream.
+    """
+    system_prompt = build_system_prompt()
+    provider = settings.llm_provider.lower()
+
+    if provider == "openai":
+        yield from _stream_openai(system_prompt, transcription, usage_out)
+    elif provider == "anthropic":
+        yield from _stream_anthropic(system_prompt, transcription, usage_out)
+    else:
+        raise ValueError(
+            f"Proveedor LLM no soportado: '{settings.llm_provider}'. "
+            "Usa 'openai' o 'anthropic'."
+        )
 
 
 def generate_estimation(transcription: str) -> EstimationResult:
