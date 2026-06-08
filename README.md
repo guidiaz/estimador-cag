@@ -54,7 +54,7 @@ cp .env.example .env
 
 | Proveedor | Modelo |
 |-----------|--------|
-| `openai` | `gpt-o4-mini` |
+| `openai` | `gpt-4o-mini` |
 | `anthropic` | `claude-haiku-4-5` |
 
 ## Ejecución
@@ -104,7 +104,7 @@ curl -X POST http://127.0.0.1:8000/api/v1/estimate \
 ```json
 {
   "estimation": "## Estimación: ...\n\n### Desglose de tareas:\n...",
-  "model": "gpt-o4-mini",
+  "model": "gpt-4o-mini",
   "provider": "openai",
   "usedTokens": 4521,
   "timestamp": 1717171200

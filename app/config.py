@@ -15,7 +15,7 @@ class Settings(BaseSettings):
             return self.llm_model
         if self.llm_provider == "anthropic":
             return "claude-haiku-4-5"
-        return "gpt-o4-mini"
+        return "gpt-4o-mini"
 
 
 settings = Settings()
