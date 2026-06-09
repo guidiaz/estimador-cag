@@ -59,6 +59,8 @@ cp .env.example .env
 
 ## Ejecución
 
+### API
+
 ```bash
 uv run uvicorn app.main:app --reload
 ```
@@ -67,6 +69,20 @@ La API queda disponible en `http://127.0.0.1:8000`. Si el puerto 8000 está bloq
 
 ```bash
 uv run uvicorn app.main:app --reload --port 8080
+```
+
+### Interfaz Streamlit (opcional)
+
+`streamlit_app.py` es un cliente HTTP de la API: una interfaz de chat con respuesta en streaming. Es un **proceso aparte**; arranca primero la API y luego, en otra terminal:
+
+```bash
+uv run streamlit run streamlit_app.py
+```
+
+La UI queda en `http://localhost:8501` y localiza la API mediante la variable `ESTIMADOR_API_URL` (por defecto `http://127.0.0.1:8000`). Si la API corre en otro host o puerto:
+
+```bash
+ESTIMADOR_API_URL=http://127.0.0.1:8080 uv run streamlit run streamlit_app.py
 ```
 
 ## Uso de la API

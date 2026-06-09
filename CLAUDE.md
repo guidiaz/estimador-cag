@@ -11,24 +11,34 @@ REST API that turns a client-meeting transcription into a structured software pr
 ```bash
 uv sync                                          # install deps (creates .venv)
 cp .env.example .env                             # then fill in API key(s)
-uv run uvicorn app.main:app --reload             # run dev server on :8000
-uv run uvicorn app.main:app --reload --port 8080 # alternate port if 8000 blocked
+uv run uvicorn app.main:app --reload             # 1) API on :8000 (alternate: --port 8080)
+uv run streamlit run streamlit_app.py            # 2) Streamlit UI on :8501
 ```
+
+The **UI and API are two separate processes** — the Streamlit app (`streamlit_app.py`) is an HTTP client of the API, not an in-process import. Run both. The UI finds the API via `ESTIMADOR_API_URL` (default `http://127.0.0.1:8000`); set it if the API runs elsewhere or on a non-default port.
 
 Docs/playground at `/docs` (Swagger UI). Health check at `/health`. There is **no test suite, linter, or formatter configured** — `pyproject.toml` declares only runtime deps.
 
 ## Architecture
 
-Request flow for the single feature endpoint `POST /api/v1/estimate`:
+Two processes: the **Streamlit UI** (`streamlit_app.py`) talks to the **FastAPI backend** purely over HTTP via the thin client in `api_client.py` — no `app.*` imports cross into the UI.
 
 ```
+streamlit_app.py ──HTTP──> api_client.py ──> FastAPI (app/)
+  UI: chat + sidebar         POST /api/v1/estimate/stream  (NDJSON token stream)
+                             GET  /api/v1/context          (provider/model/system_prompt/examples)
+
 app/main.py            FastAPI app, /health, mounts router under /api/v1
-  └─ routers/estimations.py   maps exceptions → HTTP (ValueError→400, anything else→502)
-       └─ services/llm_service.py   builds system prompt, dispatches to provider
+  └─ routers/estimations.py   3 endpoints (see below); maps ValueError→400, else→502
+       └─ services/llm_service.py   build_system_prompt + provider dispatch
+            ├─ generate_estimation   blocking → EstimationResult   (POST /estimate)
+            └─ stream_estimation     generator yielding text deltas (POST /estimate/stream)
             ├─ context/examples.py   ESTIMATION_EXAMPLES injected into the prompt (the "CAG")
             └─ config.py             settings + resolved_model
-  └─ schemas/estimation.py   EstimateRequest / EstimateResponse (Pydantic)
+  └─ schemas/estimation.py   EstimateRequest (+max_tokens) / EstimateResponse (Pydantic)
 ```
+
+The three endpoints in `routers/estimations.py`: `POST /estimate` (blocking JSON), `POST /estimate/stream` (NDJSON: `{"type":"delta"|"done"|"error", ...}` — once streaming starts the status is 200, so mid-stream errors are `error` records in the body, not HTTP codes), and `GET /context` (static CAG data for the sidebar).
 
 Key design points to know before editing:
 

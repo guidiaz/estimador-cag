@@ -1,20 +1,21 @@
 """Interfaz de chat Streamlit para el Estimador CAG.
 
-Reutiliza la lógica de llamada al LLM del proyecto (`app.services.llm_service`):
-el usuario pega o escribe la transcripción de una reunión y el asistente
-responde con la estimación de software generada.
+Consume la API del proyecto por HTTP (módulo `api_client`) en lugar de importar
+la lógica del backend en el mismo proceso. Arranca la API por separado:
 
-Ejecutar con:
-    uv run streamlit run streamlit_app.py
+    uv run uvicorn app.main:app --reload      # API  (por defecto :8000)
+    uv run streamlit run streamlit_app.py     # UI
+
+La UI apunta a la API mediante la variable de entorno `ESTIMADOR_API_URL`
+(por defecto `http://127.0.0.1:8000`).
 """
 
 import time
 
+import httpx
 import streamlit as st
 
-from app.config import settings
-from app.context.examples import ESTIMATION_EXAMPLES
-from app.services.llm_service import build_system_prompt, stream_estimation
+from api_client import API_BASE, EstimationError, get_context, request_estimation_stream
 
 st.set_page_config(page_title="Estimador CAG", page_icon="🧮")
 
@@ -42,7 +43,7 @@ if transcription:
     with st.chat_message("user"):
         st.markdown(transcription)
 
-    # Respuesta del asistente: se escribe token a token (streaming).
+    # Respuesta del asistente: se escribe token a token (streaming vía HTTP).
     with st.chat_message("assistant"):
         usage: dict = {}
         try:
@@ -53,19 +54,25 @@ if transcription:
             max_tokens = st.session_state.get("max_tokens", 4096)
             start = time.perf_counter()
             estimation = st.write_stream(
-                stream_estimation(transcription, usage, max_tokens=max_tokens)
+                request_estimation_stream(transcription, usage, max_tokens=max_tokens)
             )
             elapsed = time.perf_counter() - start
-        except ValueError as exc:
-            # Proveedor LLM no soportado u otro error de validación.
-            error = f"⚠️ {exc}"
+        except httpx.RequestError:
+            # No se pudo conectar con la API (backend apagado, URL incorrecta...).
+            error = (
+                f"⚠️ No se pudo conectar con la API en `{API_BASE}`.\n\n"
+                "Arranca el backend con `uv run uvicorn app.main:app --reload` "
+                "o ajusta la variable `ESTIMADOR_API_URL`."
+            )
             st.error(error)
             st.session_state.messages.append({"role": "assistant", "content": error})
-        except Exception as exc:  # noqa: BLE001 - mostrar cualquier fallo del proveedor
-            error = (
-                f"⚠️ Error al generar la estimación: {exc}\n\n"
-                "Revisa que la API key y el proveedor estén configurados en `.env`."
-            )
+        except EstimationError as exc:
+            # Error reportado por la API durante la generación (400 / 502).
+            error = f"⚠️ {exc.detail}"
+            st.error(error)
+            st.session_state.messages.append({"role": "assistant", "content": error})
+        except Exception as exc:  # noqa: BLE001 - cualquier otro fallo inesperado
+            error = f"⚠️ Error al generar la estimación: {exc}"
             st.error(error)
             st.session_state.messages.append({"role": "assistant", "content": error})
         else:
@@ -76,10 +83,27 @@ if transcription:
                 {"role": "assistant", "content": estimation}
             )
 
+
+@st.cache_data(show_spinner=False)
+def _load_context() -> dict:
+    """Contexto estático del backend (cacheado: no cambia entre llamadas)."""
+    return get_context()
+
+
 with st.sidebar:
     st.subheader("⚙️ Configuración")
-    st.write(f"**Proveedor:** `{settings.llm_provider}`")
-    st.write(f"**Modelo:** `{settings.resolved_model}`")
+
+    try:
+        ctx = _load_context()
+    except Exception:  # noqa: BLE001 - API no disponible al cargar el panel
+        ctx = None
+
+    if ctx:
+        st.write(f"**Proveedor:** `{ctx['provider']}`")
+        st.write(f"**Modelo:** `{ctx['model']}`")
+    else:
+        st.warning(f"API no disponible en `{API_BASE}`.")
+
     st.slider(
         "Tokens de salida (máx.)",
         min_value=512,
@@ -102,24 +126,25 @@ with st.sidebar:
     else:
         st.caption("Aún no hay llamadas en esta sesión.")
 
-    # --- Contexto CAG inyectado en el system prompt ---
-    st.subheader("🧠 Contexto CAG")
+    # --- Contexto CAG inyectado en el system prompt (vía GET /context) ---
+    if ctx:
+        st.subheader("🧠 Contexto CAG")
 
-    with st.expander("System prompt activo (solo lectura)"):
-        st.text_area(
-            "System prompt",
-            value=build_system_prompt(),
-            height=300,
-            disabled=True,
-            label_visibility="collapsed",
-        )
+        with st.expander("System prompt activo (solo lectura)"):
+            st.text_area(
+                "System prompt",
+                value=ctx["system_prompt"],
+                height=300,
+                disabled=True,
+                label_visibility="collapsed",
+            )
 
-    with st.expander(f"Estimaciones de ejemplo ({len(ESTIMATION_EXAMPLES)})"):
-        for index, example in enumerate(ESTIMATION_EXAMPLES, start=1):
-            st.markdown(f"**Ejemplo {index} — resumen de la reunión:**")
-            st.caption(example["meeting_summary"])
-            st.markdown("**Estimación generada:**")
-            st.code(example["estimation"].strip(), language="markdown")
+        with st.expander(f"Estimaciones de ejemplo ({len(ctx['examples'])})"):
+            for index, example in enumerate(ctx["examples"], start=1):
+                st.markdown(f"**Ejemplo {index} — resumen de la reunión:**")
+                st.caption(example["meeting_summary"])
+                st.markdown("**Estimación generada:**")
+                st.code(example["estimation"].strip(), language="markdown")
 
     st.divider()
     if st.button("Limpiar conversación"):

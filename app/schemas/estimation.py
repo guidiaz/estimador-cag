@@ -7,6 +7,12 @@ class EstimateRequest(BaseModel):
         min_length=1,
         description="Texto de la transcripción de la reunión con el cliente",
     )
+    max_tokens: int = Field(
+        4096,
+        ge=512,
+        le=8192,
+        description="Límite de tokens de salida que el modelo puede generar",
+    )
 
 
 class EstimateResponse(BaseModel):
