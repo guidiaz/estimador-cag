@@ -1,3 +1,4 @@
+import hashlib
 from collections.abc import Iterator
 from dataclasses import dataclass
 
@@ -6,6 +7,7 @@ from openai import OpenAI
 
 from app.config import settings
 from app.context.examples import ESTIMATION_EXAMPLES
+from app.services import cache
 
 
 @dataclass
@@ -49,6 +51,16 @@ def _format_examples() -> str:
 
 def build_system_prompt() -> str:
     return SYSTEM_PROMPT_TEMPLATE.format(examples=_format_examples())
+
+
+def _system_prompt_hash(system_prompt: str) -> str:
+    return hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
+
+
+def _chunk(text: str, size: int = 120) -> Iterator[str]:
+    """Trocea el texto para replicar la sensación de escritura al servir un hit."""
+    for start in range(0, len(text), size):
+        yield text[start : start + size]
 
 
 def _call_openai(system_prompt: str, transcription: str) -> EstimationResult:
@@ -152,20 +164,63 @@ def stream_estimation(
     Usa el mismo system prompt (CAG) y dispatch de proveedor. `max_tokens` fija
     el límite de tokens de salida. Si se pasa `usage_out`, se rellena con
     `provider`, `model` y los tokens de entrada/salida una vez terminado el stream.
+
+    Cacheado en Redis (namespace `estimate-stream:v1`). En un hit se reproduce el
+    texto cacheado troceado y se rellena `usage_out` con las métricas guardadas
+    más `cached=True`.
     """
     system_prompt = build_system_prompt()
     provider = settings.llm_provider.lower()
+    model = settings.resolved_model
+
+    key = cache.build_key(
+        "estimate-stream:v1",
+        {
+            "provider": provider,
+            "model": model,
+            "sp_hash": _system_prompt_hash(system_prompt),
+            "transcription": transcription,
+            "max_tokens": max_tokens,
+        },
+    )
+    cached = cache.get_json(key)
+    if cached is not None:
+        if usage_out is not None:
+            usage_out.update(cached["usage"])
+            usage_out["cached"] = True
+        yield from _chunk(cached["text"])
+        return
+
+    # `effective_usage` siempre existe para poder acumular y cachear las métricas,
+    # aunque el llamante no haya pasado `usage_out`.
+    effective_usage = usage_out if usage_out is not None else {}
 
     if provider == "openai":
-        yield from _stream_openai(system_prompt, transcription, usage_out, max_tokens)
+        inner = _stream_openai(system_prompt, transcription, effective_usage, max_tokens)
     elif provider == "anthropic":
-        yield from _stream_anthropic(
-            system_prompt, transcription, usage_out, max_tokens
+        inner = _stream_anthropic(
+            system_prompt, transcription, effective_usage, max_tokens
         )
     else:
         raise ValueError(
             f"Proveedor LLM no soportado: '{settings.llm_provider}'. "
             "Usa 'openai' o 'anthropic'."
+        )
+
+    buffer: list[str] = []
+    for delta in inner:
+        buffer.append(delta)
+        yield delta
+
+    # Cachear SOLO tras agotar el generador limpiamente (nunca en finally): si el
+    # proveedor falla a mitad o el cliente se desconecta (GeneratorExit), el bucle
+    # se desenrolla y no se guarda una estimación truncada. El guard de
+    # `used_tokens` evita cachear un stream que terminó sin métricas.
+    if effective_usage.get("used_tokens"):
+        cache.set_json(
+            key,
+            {"text": "".join(buffer), "usage": effective_usage},
+            settings.cache_ttl_seconds,
         )
 
 
@@ -177,16 +232,50 @@ def generate_estimation(transcription: str) -> EstimationResult:
       [system]    → Instrucciones + ejemplos de estimaciones previas
       [user]      → Transcripción de la reunión a estimar
       [assistant] → Estimación generada por el modelo
+
+    Cacheado en Redis (namespace `estimate:v1`): una transcripción repetida con el
+    mismo proveedor/modelo/system prompt se sirve desde cache sin llamar al LLM.
     """
     system_prompt = build_system_prompt()
     provider = settings.llm_provider.lower()
+    model = settings.resolved_model
+
+    key = cache.build_key(
+        "estimate:v1",
+        {
+            "provider": provider,
+            "model": model,
+            "sp_hash": _system_prompt_hash(system_prompt),
+            "transcription": transcription,
+        },
+    )
+    cached = cache.get_json(key)
+    if cached is not None:
+        return EstimationResult(
+            estimation=cached["text"],
+            model=cached["model"],
+            provider=cached["provider"],
+            used_tokens=cached["used_tokens"],
+        )
 
     if provider == "openai":
-        return _call_openai(system_prompt, transcription)
-    if provider == "anthropic":
-        return _call_anthropic(system_prompt, transcription)
+        result = _call_openai(system_prompt, transcription)
+    elif provider == "anthropic":
+        result = _call_anthropic(system_prompt, transcription)
+    else:
+        raise ValueError(
+            f"Proveedor LLM no soportado: '{settings.llm_provider}'. "
+            "Usa 'openai' o 'anthropic'."
+        )
 
-    raise ValueError(
-        f"Proveedor LLM no soportado: '{settings.llm_provider}'. "
-        "Usa 'openai' o 'anthropic'."
+    cache.set_json(
+        key,
+        {
+            "text": result.estimation,
+            "model": result.model,
+            "provider": result.provider,
+            "used_tokens": result.used_tokens,
+        },
+        settings.cache_ttl_seconds,
     )
+    return result

@@ -9,6 +9,10 @@ class Settings(BaseSettings):
     llm_provider: str = "openai"
     llm_model: str = ""
 
+    redis_url: str = "redis://localhost:6379/0"
+    cache_enabled: bool = True
+    cache_ttl_seconds: int = 86400  # 24h
+
     @property
     def resolved_model(self) -> str:
         if self.llm_model:

@@ -14,6 +14,7 @@ API REST que genera estimaciones de proyectos de software a partir de transcripc
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/) (recomendado) o pip
 - API key de OpenAI y/o Anthropic según el proveedor elegido
+- Redis (opcional, para cachear estimaciones). Ej.: `docker run -p 6379:6379 redis`. Si no hay Redis, la app funciona igual sin cache.
 
 ## Instalación
 
@@ -49,6 +50,9 @@ cp .env.example .env
 | `LLM_MODEL` | Modelo explícito; si está vacío se usa el predeterminado del proveedor |
 | `APP_ENV` | Entorno de ejecución (opcional) |
 | `LOG_LEVEL` | Nivel de logging (opcional) |
+| `REDIS_URL` | URL de Redis para el cache (por defecto `redis://localhost:6379/0`) |
+| `CACHE_ENABLED` | Activa/desactiva el cache de estimaciones (por defecto `true`) |
+| `CACHE_TTL_SECONDS` | Expiración de las entradas de cache en segundos (por defecto `86400`) |
 
 **Modelos por defecto** (cuando `LLM_MODEL` está vacío):
 
@@ -148,6 +152,15 @@ También puedes probar el endpoint desde la documentación interactiva en [http:
 3. El modelo devuelve una estimación con desglose de tareas, horas, equipo recomendado y duración.
 
 Para ajustar el comportamiento del estimador, edita o amplía los ejemplos en `app/context/examples.py`.
+
+## Cache (Redis)
+
+Las llamadas a `POST /api/v1/estimate` y `POST /api/v1/estimate/stream` se cachean en Redis: una transcripción repetida con el mismo proveedor, modelo y contexto CAG se sirve al instante y sin coste de tokens (en el endpoint de streaming, la respuesta cacheada se reproduce troceada y el registro `done` incluye `cached: true`).
+
+- La clave incluye un hash del *system prompt*, así que **editar los ejemplos de `app/context/examples.py` invalida el cache automáticamente**.
+- **Degradación elegante:** si Redis no está disponible, las peticiones siguen funcionando sin cache (no fallan). Tras un fallo de conexión, el cache se omite durante 30 s para no penalizar la latencia.
+- **Nota de comportamiento:** con el cache activo, transcripciones idénticas devuelven siempre la misma respuesta (antes podían variar entre llamadas por la temperatura del modelo).
+- Desactívalo con `CACHE_ENABLED=false`.
 
 ## Estructura del proyecto
 

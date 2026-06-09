@@ -43,15 +43,16 @@ The three endpoints in `routers/estimations.py`: `POST /estimate` (blocking JSON
 Key design points to know before editing:
 
 - **Provider dispatch lives in `services/llm_service.py`** (`generate_estimation` → `_call_openai` / `_call_anthropic`). It branches on `settings.llm_provider`. Adding a provider means a new `_call_*` plus a branch here; an unknown provider raises `ValueError`, which the router converts to **400**. Any other failure (bad API key, network, model name) surfaces as **502**.
-- **Model selection is in `config.py::Settings.resolved_model`**: if `LLM_MODEL` is set it wins; otherwise the default depends on provider (`anthropic` → `claude-haiku-4-5`, else → `gpt-o4-mini`). Don't hardcode model names elsewhere.
+- **Model selection is in `config.py::Settings.resolved_model`**: if `LLM_MODEL` is set it wins; otherwise the default depends on provider (`anthropic` → `claude-haiku-4-5`, else → `gpt-4o-mini`). Don't hardcode model names elsewhere.
 - **The prompt is the product.** `build_system_prompt()` formats every entry of `ESTIMATION_EXAMPLES` into the system message; the transcription is the only user message. To change estimate style/format/granularity, edit the examples in `app/context/examples.py` or `SYSTEM_PROMPT_TEMPLATE` — not the call sites.
 - **API responses are camelCase over snake_case internals.** `EstimateResponse` uses a Pydantic alias (`used_tokens` ↔ `usedTokens`) with `populate_by_name=True`. Keep that convention for new response fields.
+- **Caching is internal to the service, not the router.** `generate_estimation` and `stream_estimation` wrap their LLM calls with `app/services/cache.py` (Redis), keyed per-endpoint (`estimate:v1:` / `estimate-stream:v1:`) by a sha256 of `{provider, model, sp_hash, transcription[, max_tokens]}`. The `sp_hash` means changing `ESTIMATION_EXAMPLES` auto-invalidates. Two rules when editing the stream path: (1) write to cache **after** the delta loop exhausts cleanly, **never in `finally`** — otherwise a truncated/aborted stream gets cached; (2) `cache.py` must **degrade gracefully** (any Redis error → treat as miss/no-op, never raise) with a short connect timeout + circuit breaker so a down Redis can't slow or break requests.
 
 ## Config / environment
 
-Settings come from `.env` via `pydantic-settings` (`extra="ignore"`). Relevant vars: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `LLM_PROVIDER` (`openai` | `anthropic`, default `openai`), `LLM_MODEL` (blank = provider default). The app reads keys eagerly inside the `_call_*` functions, so a missing key fails at request time as a 502, not at startup.
+Settings come from `.env` via `pydantic-settings` (`extra="ignore"`). Relevant vars: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `LLM_PROVIDER` (`openai` | `anthropic`, default `openai`), `LLM_MODEL` (blank = provider default), and the cache vars `REDIS_URL` (default `redis://localhost:6379/0`), `CACHE_ENABLED` (default `true`), `CACHE_TTL_SECONDS` (default `86400`). The app reads keys eagerly inside the `_call_*` functions, so a missing key fails at request time as a 502, not at startup.
 
 ## Notes
 
 - All prose, prompts, error messages, and examples are in **Spanish** — match that when extending user-facing strings.
-- `streamlit_app.py` (untracked) is an empty placeholder, presumably a planned UI; ignore unless asked.
+- `streamlit_app.py` + `api_client.py` are the UI: a Streamlit chat client that talks to the API over HTTP (see Architecture). Run it as a second process.
