@@ -10,6 +10,7 @@ argumento `version`: no hay rutas ni nombres de plantilla codificados fuera de
 este módulo, de modo que el resto del código no necesita tocarse.
 """
 
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -21,6 +22,12 @@ from app.schemas import EstimationRequest
 # desde directorios distintos, así que solo `__file__` resuelve de forma robusta.
 _ESTIMATION_DIR = Path(__file__).parent / "estimation"
 
+# `version` puede venir de un query param (entrada no confiable) y se usa como
+# nombre de directorio. Validación de entrada / defensa en profundidad: solo
+# nombres simples, sin separadores de ruta ni `..`, antes de tocar el sistema de
+# ficheros.
+_VERSION_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
 
 @lru_cache(maxsize=None)
 def _environment(version: str) -> Environment:
@@ -30,6 +37,8 @@ def _environment(version: str) -> Environment:
     `get_template("system.j2")` como `{% include "examples.j2" %}` usan nombres
     simples y cambiar de versión no obliga a editar ninguna plantilla.
     """
+    if not _VERSION_RE.fullmatch(version):
+        raise ValueError(f"Versión de prompt no válida: {version!r}")
     version_dir = _ESTIMATION_DIR / version
     if not version_dir.is_dir():
         raise ValueError(f"Versión de prompt desconocida: {version!r}")
@@ -50,7 +59,12 @@ def render_estimation_prompt(
     Los enums se pasan por su `.value` (string) para que tanto la interpolación
     `{{ ... }}` como las comparaciones `{% if ... %}` de las plantillas operen
     sobre el valor del contrato y no sobre el repr del enum.
+
+    `version` se normaliza a minúsculas (los directorios de versión lo son), de
+    modo que `V2` resuelve a `v2` de forma idéntica en cualquier sistema de
+    ficheros, sea o no sensible a mayúsculas.
     """
+    version = version.lower()
     env = _environment(version)
     context = {
         "description": request.description,

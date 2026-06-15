@@ -1,0 +1,29 @@
+### Ejemplo 1 — Pipeline de datos para analítica de e-commerce
+
+Ingesta de eventos de tienda y marketing hacia un almacén analítico, con transformaciones, tests de calidad y paneles para negocio. La pega habitual: fuentes sucias y esquemas que cambian sin avisar.
+
+| Fase | Tareas principales | Horas | Duración |
+|------|--------------------|------:|----------|
+| Ingesta y staging | Conectores, ingesta incremental, control de esquema | 120 | 3 sem |
+| Transformación y calidad | Modelado, tests de datos, alertas | 160 | 4 sem |
+| Servido y paneles | Capa semántica, dashboards, accesos | 100 | 2 sem |
+| **Total** | | **380** | **~7 sem** |
+
+Colchón recomendado: 25% (las fuentes externas son la mayor incógnita).
+Riesgo principal: cambios de esquema no anunciados en las fuentes de origen.
+Confianza: media
+
+### Ejemplo 2 — Herramienta interna de gestión de incidencias
+
+App web interna para registrar incidencias, asignarlas y seguir SLAs, con roles y notificaciones. Aparentemente sencilla; el coste real está en los permisos y en la migración del histórico.
+
+| Fase | Tareas principales | Horas | Duración |
+|------|--------------------|------:|----------|
+| Núcleo y permisos | CRUD de incidencias, roles, auditoría | 140 | 3 sem |
+| SLAs y notificaciones | Reglas de SLA, recordatorios, email | 90 | 2 sem |
+| Migración y despliegue | Importación del histórico, QA, alta interna | 70 | 2 sem |
+| **Total** | | **300** | **~6 sem** |
+
+Colchón recomendado: 20% (la migración del histórico suele sorprender).
+Riesgo principal: datos heredados inconsistentes que rompen las reglas de SLA.
+Confianza: alta

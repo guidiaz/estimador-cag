@@ -1,7 +1,7 @@
 import json
 
 import structlog
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from app.config import settings
@@ -24,9 +24,23 @@ logger = structlog.get_logger("app.estimations")
 
 
 @router.post("/estimate", response_model=EstimationResponse)
-def create_estimate(request: EstimationRequest) -> EstimationResponse:
+def create_estimate(
+    request: EstimationRequest,
+    prompt_version: str = Query(
+        default=PROMPT_VERSION,
+        description=(
+            "Versión de las plantillas de prompt a usar (p. ej. `v1`, `v2`). "
+            "Una versión inexistente o con nombre no válido devuelve 400."
+        ),
+    ),
+) -> EstimationResponse:
+    # Normalizamos a minúsculas (los directorios de versión lo son): así `V2` y
+    # `v2` renderizan, cachean y se devuelven igual en cualquier SO. Sin esto, un
+    # FS case-insensitive (Windows) colaría con `V2` mientras Linux daría 400, y
+    # además la clave de cache y la versión devuelta divergirían de la renderizada.
+    prompt_version = prompt_version.lower()
     try:
-        result = generate_estimation(request)
+        result = generate_estimation(request, version=prompt_version)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -35,7 +49,8 @@ def create_estimate(request: EstimationRequest) -> EstimationResponse:
             detail=f"Error al generar la estimación: {exc}",
         ) from exc
 
-    return EstimationResponse(text=result.estimation, prompt_version=PROMPT_VERSION)
+    # Devolvemos la versión efectivamente usada (la que renderizó sin error).
+    return EstimationResponse(text=result.estimation, prompt_version=prompt_version)
 
 
 @router.post("/estimate/stream")

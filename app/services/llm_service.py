@@ -328,7 +328,9 @@ def stream_estimation(
         )
 
 
-def generate_estimation(request: EstimationRequest) -> EstimationResult:
+def generate_estimation(
+    request: EstimationRequest, version: str = PROMPT_VERSION
+) -> EstimationResult:
     """
     Genera una estimación de software a partir de una petición estructurada.
 
@@ -339,21 +341,21 @@ def generate_estimation(request: EstimationRequest) -> EstimationResult:
       [assistant] → Estimación generada por el modelo
 
     El prompt se renderiza con `render_estimation_prompt` desde las plantillas
-    Jinja2 versionadas (`PROMPT_VERSION`). Cacheado en Redis (namespace
-    `estimate:v2`), con clave derivada de la versión del prompt y de todos los
-    campos del contrato: una petición idéntica con el mismo modelo primario se
-    sirve desde cache sin llamar al LLM.
+    Jinja2 de la versión `version` (por defecto `PROMPT_VERSION`; el endpoint
+    permite elegirla con `?prompt_version=`). Una versión inexistente o con un
+    nombre no válido lanza `ValueError` (→ 400 en el router). Cacheado en Redis
+    (namespace `estimate:v2`), con clave derivada de la versión del prompt y de
+    todos los campos del contrato: una petición idéntica con el mismo modelo
+    primario se sirve desde cache sin llamar al LLM.
     """
-    system_prompt, user_message = render_estimation_prompt(
-        request, version=PROMPT_VERSION
-    )
+    system_prompt, user_message = render_estimation_prompt(request, version=version)
 
     key = cache.build_key(
         "estimate:v2",
         {
             "primary_model": settings.primary_model,
             "sp_hash": _system_prompt_hash(system_prompt),
-            "prompt_version": PROMPT_VERSION,
+            "prompt_version": version,
             "description": request.description,
             "project_type": request.project_type.value,
             "detail_level": request.detail_level.value,
@@ -365,6 +367,7 @@ def generate_estimation(request: EstimationRequest) -> EstimationResult:
         logger.info(
             "estimate.completed",
             cached=True,
+            prompt_version=version,
             model=cached["model"],
             provider=cached["provider"],
             used_tokens=cached["used_tokens"],
@@ -383,6 +386,7 @@ def generate_estimation(request: EstimationRequest) -> EstimationResult:
     logger.info(
         "estimate.completed",
         cached=False,
+        prompt_version=version,
         model=result.model,
         provider=result.provider,
         used_tokens=result.used_tokens,
