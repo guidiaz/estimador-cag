@@ -18,3 +18,13 @@ dependencies = [
     "structlog>=26.1.0",
     "uvicorn[standard]>=0.48.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.0",
+]
+
+[tool.pytest.ini_options]
+# Pone la raíz del repo en sys.path para que `from app...` resuelva en los tests.
+pythonpath = ["."]
+testpaths = ["tests"]
