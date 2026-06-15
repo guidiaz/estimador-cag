@@ -1,14 +1,18 @@
 import hashlib
 import itertools
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 
 import litellm
+import structlog
 from litellm import Router
 
 from app.config import settings
 from app.context.examples import ESTIMATION_EXAMPLES
 from app.services import cache
+
+logger = structlog.get_logger("app.llm")
 
 
 @dataclass
@@ -190,7 +194,13 @@ def _stream(
     except StopIteration:
         iterator = iter(())
         first_chunk = None
-    except _CONNECTION_ERRORS:
+    except _CONNECTION_ERRORS as exc:
+        logger.warning(
+            "estimate.stream.fallback",
+            reason=type(exc).__name__,
+            primary_model=settings.primary_model,
+            fallback_model=settings.fallback_model,
+        )
         iterator = iter(_open(_FALLBACK))
         first_chunk = next(iterator, None)
 
@@ -261,6 +271,14 @@ def stream_estimation(
         if usage_out is not None:
             usage_out.update(cached["usage"])
             usage_out["cached"] = True
+        logger.info(
+            "estimate.stream.completed",
+            cached=True,
+            model=cached["usage"].get("model"),
+            provider=cached["usage"].get("provider"),
+            used_tokens=cached["usage"].get("used_tokens"),
+            transcription_chars=len(transcription),
+        )
         yield from _chunk(cached["text"])
         return
 
@@ -269,10 +287,25 @@ def stream_estimation(
     effective_usage = usage_out if usage_out is not None else {}
     inner = _stream(system_prompt, transcription, effective_usage, max_tokens)
 
+    start = time.monotonic()
     buffer: list[str] = []
     for delta in inner:
         buffer.append(delta)
         yield delta
+
+    # El evento de completado se emite SOLO aquí, tras agotar el generador
+    # limpiamente: en streaming el status HTTP ya se envió antes de consumir el
+    # cuerpo, así que la middleware de acceso no puede portar las métricas. Si el
+    # stream se aborta a mitad, el bucle se desenrolla y este log no se emite.
+    logger.info(
+        "estimate.stream.completed",
+        cached=False,
+        model=effective_usage.get("model"),
+        provider=effective_usage.get("provider"),
+        used_tokens=effective_usage.get("used_tokens"),
+        transcription_chars=len(transcription),
+        duration_ms=round((time.monotonic() - start) * 1000, 2),
+    )
 
     # Cachear SOLO tras agotar el generador limpiamente (nunca en finally): si el
     # proveedor falla a mitad o el cliente se desconecta (GeneratorExit), el bucle
@@ -310,6 +343,14 @@ def generate_estimation(transcription: str) -> EstimationResult:
     )
     cached = cache.get_json(key)
     if cached is not None:
+        logger.info(
+            "estimate.completed",
+            cached=True,
+            model=cached["model"],
+            provider=cached["provider"],
+            used_tokens=cached["used_tokens"],
+            transcription_chars=len(transcription),
+        )
         return EstimationResult(
             estimation=cached["text"],
             model=cached["model"],
@@ -317,7 +358,17 @@ def generate_estimation(transcription: str) -> EstimationResult:
             used_tokens=cached["used_tokens"],
         )
 
+    start = time.monotonic()
     result = _complete(system_prompt, transcription)
+    logger.info(
+        "estimate.completed",
+        cached=False,
+        model=result.model,
+        provider=result.provider,
+        used_tokens=result.used_tokens,
+        transcription_chars=len(transcription),
+        duration_ms=round((time.monotonic() - start) * 1000, 2),
+    )
 
     cache.set_json(
         key,

@@ -1,6 +1,10 @@
 from fastapi import FastAPI
 
+from app.logging_config import configure_logging
+from app.middleware import RequestContextMiddleware
 from app.routers import estimations
+
+configure_logging()
 
 app = FastAPI(
     title="Estimador CAG",
@@ -9,6 +13,8 @@ app = FastAPI(
         "transcripciones de reuniones, utilizando ejemplos previos como contexto (CAG)."
     ),
 )
+
+app.add_middleware(RequestContextMiddleware)
 
 
 @app.get("/health")

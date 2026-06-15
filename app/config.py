@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     cache_enabled: bool = True
     cache_ttl_seconds: int = 86400  # 24h
 
+    # Observabilidad (structlog). `log_json=true` fuerza salida JSON aunque haya
+    # TTY; por defecto se decide según haya o no terminal adjunto.
+    log_level: str = "INFO"
+    log_json: bool = False
+
     @property
     def resolved_model(self) -> str:
         if self.llm_model:

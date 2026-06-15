@@ -1,6 +1,7 @@
 import json
 import time
 
+import structlog
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
@@ -14,6 +15,8 @@ from app.services.llm_service import (
 )
 
 router = APIRouter(tags=["estimations"])
+
+logger = structlog.get_logger("app.estimations")
 
 
 @router.post("/estimate", response_model=EstimateResponse)
@@ -58,9 +61,11 @@ def create_estimate_stream(request: EstimateRequest) -> StreamingResponse:
             ):
                 yield json.dumps({"type": "delta", "text": delta}) + "\n"
         except ValueError as exc:
+            logger.warning("estimate.stream.error", code=400, error=str(exc))
             yield json.dumps({"type": "error", "code": 400, "detail": str(exc)}) + "\n"
             return
         except Exception as exc:  # noqa: BLE001 - reportar cualquier fallo del proveedor
+            logger.exception("estimate.stream.error", code=502, error=str(exc))
             yield json.dumps({"type": "error", "code": 502, "detail": str(exc)}) + "\n"
             return
         yield json.dumps({"type": "done", "usage": usage}) + "\n"
