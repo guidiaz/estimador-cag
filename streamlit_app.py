@@ -18,7 +18,13 @@ import time
 import httpx
 import streamlit as st
 
-from api_client import API_BASE, EstimationError, get_context, request_estimation
+from api_client import (
+    API_BASE,
+    EstimationError,
+    build_reference_projects,
+    get_context,
+    request_estimation,
+)
 
 # Etiquetas en español ↔ valores del contrato (los enums de `app/schemas.py`).
 PROJECT_TYPES = {
@@ -41,6 +47,11 @@ OUTPUT_FORMATS = {
 # Límites del contrato (`EstimationRequest.description`), validados también aquí.
 _DESC_MIN = 20
 _DESC_MAX = 2000
+
+# Tope de proyectos de referencia (`EstimationRequest.reference_projects`,
+# `max_length=8`): se valida en la UI para no enviar una petición que la API
+# rechazaría con 422.
+_REF_MAX = 8
 
 st.set_page_config(page_title="Estimador CAG", page_icon="🧮")
 
@@ -79,21 +90,66 @@ with st.form("estimation_form"):
         format_func=OUTPUT_FORMATS.get,
     )
 
+    st.markdown("**Proyectos de referencia** (opcional)")
+    st.caption(
+        "Proyectos similares ya entregados que sirvan de ancla para calibrar la "
+        f"estimación. Nombre y descripción son obligatorios; máximo {_REF_MAX}."
+    )
+    # Sembramos una fila vacía: garantiza que las columnas se rendericen en
+    # cualquier versión de Streamlit y las filas en blanco se descartan al enviar.
+    reference_rows = st.data_editor(
+        [{"name": None, "description": None, "total_hours": None,
+          "duration": None, "notes": None}],
+        num_rows="dynamic",
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "name": st.column_config.TextColumn("Nombre", max_chars=120),
+            "description": st.column_config.TextColumn(
+                "Descripción", max_chars=1000, width="large"
+            ),
+            "total_hours": st.column_config.NumberColumn(
+                "Horas reales", min_value=1, max_value=100_000, step=1, format="%d"
+            ),
+            "duration": st.column_config.TextColumn("Duración", max_chars=60),
+            "notes": st.column_config.TextColumn("Notas", max_chars=500),
+        },
+        key="reference_projects_editor",
+    )
+
     submitted = st.form_submit_button("Generar estimación", type="primary")
 
 if submitted:
     description = description.strip()
+    reference_projects, ref_problems = build_reference_projects(reference_rows)
+
+    # Validamos en bloque (descripción + referencias) antes de llamar a la API.
+    errors = []
     if len(description) < _DESC_MIN:
-        st.warning(
+        errors.append(
             f"La descripción debe tener al menos {_DESC_MIN} caracteres "
             f"(actual: {len(description)})."
         )
+    errors.extend(ref_problems)
+    if len(reference_projects) > _REF_MAX:
+        errors.append(
+            f"Como máximo {_REF_MAX} proyectos de referencia "
+            f"(tienes {len(reference_projects)}). Quita algunos."
+        )
+
+    if errors:
+        for message in errors:
+            st.warning(message)
     else:
         try:
             start = time.perf_counter()
             with st.spinner("Generando estimación…"):
                 result = request_estimation(
-                    description, project_type, detail_level, output_format
+                    description,
+                    project_type,
+                    detail_level,
+                    output_format,
+                    reference_projects=reference_projects or None,
                 )
             elapsed = time.perf_counter() - start
         except httpx.RequestError:

@@ -33,18 +33,97 @@ class EstimationError(Exception):
         self.code = code
 
 
+# Mínimos del contrato `ReferenceProject` (app/schemas.py). Se replican aquí para
+# avisar en la UI antes de llegar a la API: un fallo de validación anidado vuelve
+# como lista 422 y se renderiza como JSON poco legible (igual que evitamos para
+# `description` validando su longitud mínima en la propia UI).
+_REF_NAME_MIN = 3
+_REF_DESCRIPTION_MIN = 10
+
+
+def _as_optional_int(value) -> int | None:
+    """Convierte el valor de horas del editor a `int | None`.
+
+    El `NumberColumn` puede devolver `float` (p. ej. `670.0`), `None` para una
+    celda vacía o `NaN` según el backend de datos. Todo lo no convertible se trata
+    como «sin dato» (None) en lugar de reventar.
+    """
+    if value is None:
+        return None
+    try:
+        if value != value:  # NaN: único valor distinto de sí mismo
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_reference_projects(rows) -> tuple[list[dict], list[str]]:
+    """Transforma las filas del editor en payload `reference_projects`.
+
+    Devuelve `(refs, problems)`:
+
+    - `refs`: lista lista para enviar, solo con filas **completas y válidas**
+      (nombre y descripción presentes y por encima de su mínimo); los campos
+      opcionales en blanco se omiten para que coincidan con «sin dato».
+    - `problems`: descripciones en español de filas con datos parciales o que no
+      cumplen los mínimos del contrato, para avisar en la UI.
+
+    Las filas totalmente vacías se ignoran en silencio (el editor siempre muestra
+    al menos una). Función pura: sin Streamlit ni red, testeable de forma aislada.
+    """
+    refs: list[dict] = []
+    problems: list[str] = []
+
+    for index, row in enumerate(rows, start=1):
+        name = (row.get("name") or "").strip()
+        description = (row.get("description") or "").strip()
+        total_hours = _as_optional_int(row.get("total_hours"))
+        duration = (row.get("duration") or "").strip()
+        notes = (row.get("notes") or "").strip()
+
+        # Fila sin ningún dato: el usuario no la rellenó, se ignora.
+        if not any([name, description, total_hours, duration, notes]):
+            continue
+
+        errs: list[str] = []
+        if len(name) < _REF_NAME_MIN:
+            errs.append(f"el nombre debe tener al menos {_REF_NAME_MIN} caracteres")
+        if len(description) < _REF_DESCRIPTION_MIN:
+            errs.append(
+                "la descripción debe tener al menos "
+                f"{_REF_DESCRIPTION_MIN} caracteres"
+            )
+        if errs:
+            problems.append(f"Proyecto de referencia {index}: {'; '.join(errs)}.")
+            continue
+
+        ref: dict = {"name": name, "description": description}
+        if total_hours is not None:
+            ref["total_hours"] = total_hours
+        if duration:
+            ref["duration"] = duration
+        if notes:
+            ref["notes"] = notes
+        refs.append(ref)
+
+    return refs, problems
+
+
 def request_estimation(
     description: str,
     project_type: str,
     detail_level: str,
     output_format: str,
+    reference_projects: list[dict] | None = None,
 ) -> dict:
     """Llama a `POST /api/v1/estimate` (bloqueante) con el contrato estructurado.
 
     Envía un `EstimationRequest` JSON y devuelve la respuesta como dict
-    (`{"text": ..., "prompt_version": ...}`). Lanza `EstimationError` si la API
-    responde con un error (400 validación de negocio, 422 validación del
-    contrato, 502 fallo del proveedor).
+    (`{"text": ..., "prompt_version": ...}`). `reference_projects` (opcional) se
+    incluye solo cuando trae elementos, de modo que «sin referencias» no manda el
+    campo. Lanza `EstimationError` si la API responde con un error (400 validación
+    de negocio, 422 validación del contrato, 502 fallo del proveedor).
     """
     payload = {
         "description": description,
@@ -52,6 +131,8 @@ def request_estimation(
         "detail_level": detail_level,
         "output_format": output_format,
     }
+    if reference_projects:
+        payload["reference_projects"] = reference_projects
     response = httpx.post(
         f"{API_BASE}/api/v1/estimate", json=payload, timeout=_TIMEOUT
     )
