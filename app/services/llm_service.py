@@ -1,9 +1,10 @@
 import hashlib
+import itertools
 from collections.abc import Iterator
 from dataclasses import dataclass
 
-from anthropic import Anthropic
-from openai import OpenAI
+import litellm
+from litellm import Router
 
 from app.config import settings
 from app.context.examples import ESTIMATION_EXAMPLES
@@ -63,96 +64,171 @@ def _chunk(text: str, size: int = 120) -> Iterator[str]:
         yield text[start : start + size]
 
 
-def _call_openai(system_prompt: str, transcription: str) -> EstimationResult:
-    client = OpenAI(api_key=settings.openai_api_key)
-    response = client.chat.completions.create(
-        model=settings.resolved_model,
+# --- LiteLLM Router: anthropic primario, openai fallback ---
+#
+# Política: el grupo primario ("estimador" → anthropic) se reintenta una vez ante
+# errores transitorios (incluida la conexión) con `num_retries=1`; al agotarse, el
+# Router cae al grupo de fallback ("estimador-fallback" → openai). En LiteLLM el
+# orden es retries-dentro-de-fallbacks, justo lo requerido.
+
+_PRIMARY = "estimador"
+_FALLBACK = "estimador-fallback"
+
+# Errores de conexión/transitorios ante los que forzamos el fallback manual en el
+# path de streaming (donde el fallback interno de litellm puede no dispararse).
+_CONNECTION_ERRORS = (
+    litellm.APIConnectionError,
+    litellm.Timeout,
+    litellm.ServiceUnavailableError,
+    litellm.InternalServerError,
+)
+
+_router: Router | None = None
+
+
+def _provider_from_model(model: str | None) -> str:
+    return "anthropic" if "claude" in (model or "").lower() else "openai"
+
+
+def _api_key_for(model: str) -> str:
+    """La API key sigue al proveedor del modelo, no al rol primario/fallback,
+    para que intercambiar `primary_model`/`fallback_model` no cruce las claves."""
+    if _provider_from_model(model) == "anthropic":
+        return settings.anthropic_api_key
+    return settings.openai_api_key
+
+
+def _get_router() -> Router:
+    global _router
+    if _router is None:
+        _router = Router(
+            model_list=[
+                {
+                    "model_name": _PRIMARY,
+                    "litellm_params": {
+                        "model": settings.primary_model,
+                        "api_key": _api_key_for(settings.primary_model),
+                    },
+                },
+                {
+                    "model_name": _FALLBACK,
+                    "litellm_params": {
+                        "model": settings.fallback_model,
+                        "api_key": _api_key_for(settings.fallback_model),
+                    },
+                },
+            ],
+            fallbacks=[{_PRIMARY: [_FALLBACK]}],
+            num_retries=1,
+        )
+    return _router
+
+
+def _complete(
+    system_prompt: str, transcription: str, max_tokens: int = 4096
+) -> EstimationResult:
+    # anthropic vía litellm requiere `max_tokens`; lo fijamos aquí (este path no lo
+    # recibe del cliente).
+    response = _get_router().completion(
+        model=_PRIMARY,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": transcription},
         ],
+        max_tokens=max_tokens,
     )
-    used_tokens = response.usage.total_tokens if response.usage else 0
+    usage = getattr(response, "usage", None)
+    used_tokens = getattr(usage, "total_tokens", 0) or 0
+    model = response.model or settings.primary_model
+    hidden = getattr(response, "_hidden_params", None) or {}
+    provider = hidden.get("custom_llm_provider") or _provider_from_model(model)
     return EstimationResult(
         estimation=response.choices[0].message.content or "",
-        model=settings.resolved_model,
-        provider="openai",
+        model=model,
+        provider=provider,
         used_tokens=used_tokens,
     )
 
 
-def _call_anthropic(system_prompt: str, transcription: str) -> EstimationResult:
-    client = Anthropic(api_key=settings.anthropic_api_key)
-    response = client.messages.create(
-        model=settings.resolved_model,
-        max_tokens=4096,
-        system=system_prompt,
-        messages=[
-            {"role": "user", "content": transcription},
-        ],
-    )
-    used_tokens = response.usage.input_tokens + response.usage.output_tokens
-    return EstimationResult(
-        estimation=response.content[0].text,
-        model=settings.resolved_model,
-        provider="anthropic",
-        used_tokens=used_tokens,
-    )
+def _best_effort_tokens(captured: dict, messages: list, text: str) -> None:
+    """Estima tokens si el proveedor no devolvió usage (anthropic+include_usage
+    es históricamente inestable). Silencioso ante cualquier fallo."""
+    try:
+        model = captured.get("model") or settings.primary_model
+        in_tok = litellm.token_counter(model=model, messages=messages)
+        out_tok = litellm.token_counter(model=model, text=text)
+        captured["input_tokens"] = in_tok
+        captured["output_tokens"] = out_tok
+        captured["used_tokens"] = in_tok + out_tok
+    except Exception:  # noqa: BLE001 - el conteo es best-effort
+        pass
 
 
-def _stream_openai(
+def _stream(
     system_prompt: str, transcription: str, usage_out: dict | None, max_tokens: int
 ) -> Iterator[str]:
-    client = OpenAI(api_key=settings.openai_api_key)
-    stream = client.chat.completions.create(
-        model=settings.resolved_model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": transcription},
-        ],
-        max_tokens=max_tokens,
-        stream=True,
-        stream_options={"include_usage": True},
-    )
-    for chunk in stream:
-        if chunk.choices and chunk.choices[0].delta.content:
-            yield chunk.choices[0].delta.content
-        if chunk.usage and usage_out is not None:
-            usage_out["input_tokens"] = chunk.usage.prompt_tokens
-            usage_out["output_tokens"] = chunk.usage.completion_tokens
-            usage_out["used_tokens"] = chunk.usage.total_tokens
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": transcription},
+    ]
 
-    if usage_out is not None:
-        usage_out.setdefault("input_tokens", 0)
-        usage_out.setdefault("output_tokens", 0)
-        usage_out.setdefault("used_tokens", 0)
-        usage_out["model"] = settings.resolved_model
-        usage_out["provider"] = "openai"
-
-
-def _stream_anthropic(
-    system_prompt: str, transcription: str, usage_out: dict | None, max_tokens: int
-) -> Iterator[str]:
-    client = Anthropic(api_key=settings.anthropic_api_key)
-    with client.messages.stream(
-        model=settings.resolved_model,
-        max_tokens=max_tokens,
-        system=system_prompt,
-        messages=[
-            {"role": "user", "content": transcription},
-        ],
-    ) as stream:
-        yield from stream.text_stream
-        final_message = stream.get_final_message()
-
-    if usage_out is not None:
-        usage_out["input_tokens"] = final_message.usage.input_tokens
-        usage_out["output_tokens"] = final_message.usage.output_tokens
-        usage_out["used_tokens"] = (
-            final_message.usage.input_tokens + final_message.usage.output_tokens
+    def _open(model_name: str):
+        return _get_router().completion(
+            model=model_name,
+            messages=messages,
+            max_tokens=max_tokens,
+            stream=True,
+            stream_options={"include_usage": True},
         )
-        usage_out["model"] = settings.resolved_model
-        usage_out["provider"] = "anthropic"
+
+    # Contingencia de fallback en streaming: si el primario falla por conexión
+    # ANTES del primer chunk, forzamos el fallback manualmente. Es seguro porque
+    # todavía no se ha emitido ningún token al cliente.
+    try:
+        iterator = iter(_open(_PRIMARY))
+        first_chunk = next(iterator)
+    except StopIteration:
+        iterator = iter(())
+        first_chunk = None
+    except _CONNECTION_ERRORS:
+        iterator = iter(_open(_FALLBACK))
+        first_chunk = next(iterator, None)
+
+    captured: dict = {}
+    text_parts: list[str] = []
+
+    def _absorb(chunk) -> str | None:
+        usage = getattr(chunk, "usage", None)
+        if usage:
+            captured["input_tokens"] = getattr(usage, "prompt_tokens", 0) or 0
+            captured["output_tokens"] = getattr(usage, "completion_tokens", 0) or 0
+            captured["used_tokens"] = getattr(usage, "total_tokens", 0) or 0
+        model = getattr(chunk, "model", None)
+        if model:
+            captured["model"] = model
+        choices = getattr(chunk, "choices", None)
+        return choices[0].delta.content if choices else None
+
+    chunks = (
+        itertools.chain([first_chunk], iterator)
+        if first_chunk is not None
+        else iterator
+    )
+    for chunk in chunks:
+        delta = _absorb(chunk)
+        if delta:
+            text_parts.append(delta)
+            yield delta
+
+    if usage_out is not None:
+        if not captured.get("used_tokens"):
+            _best_effort_tokens(captured, messages, "".join(text_parts))
+        model = captured.get("model") or settings.primary_model
+        usage_out["input_tokens"] = captured.get("input_tokens", 0)
+        usage_out["output_tokens"] = captured.get("output_tokens", 0)
+        usage_out["used_tokens"] = captured.get("used_tokens", 0)
+        usage_out["model"] = model
+        usage_out["provider"] = _provider_from_model(model)
 
 
 def stream_estimation(
@@ -165,19 +241,16 @@ def stream_estimation(
     el límite de tokens de salida. Si se pasa `usage_out`, se rellena con
     `provider`, `model` y los tokens de entrada/salida una vez terminado el stream.
 
-    Cacheado en Redis (namespace `estimate-stream:v1`). En un hit se reproduce el
+    Cacheado en Redis (namespace `estimate-stream:v2`). En un hit se reproduce el
     texto cacheado troceado y se rellena `usage_out` con las métricas guardadas
     más `cached=True`.
     """
     system_prompt = build_system_prompt()
-    provider = settings.llm_provider.lower()
-    model = settings.resolved_model
 
     key = cache.build_key(
-        "estimate-stream:v1",
+        "estimate-stream:v2",
         {
-            "provider": provider,
-            "model": model,
+            "primary_model": settings.primary_model,
             "sp_hash": _system_prompt_hash(system_prompt),
             "transcription": transcription,
             "max_tokens": max_tokens,
@@ -194,18 +267,7 @@ def stream_estimation(
     # `effective_usage` siempre existe para poder acumular y cachear las métricas,
     # aunque el llamante no haya pasado `usage_out`.
     effective_usage = usage_out if usage_out is not None else {}
-
-    if provider == "openai":
-        inner = _stream_openai(system_prompt, transcription, effective_usage, max_tokens)
-    elif provider == "anthropic":
-        inner = _stream_anthropic(
-            system_prompt, transcription, effective_usage, max_tokens
-        )
-    else:
-        raise ValueError(
-            f"Proveedor LLM no soportado: '{settings.llm_provider}'. "
-            "Usa 'openai' o 'anthropic'."
-        )
+    inner = _stream(system_prompt, transcription, effective_usage, max_tokens)
 
     buffer: list[str] = []
     for delta in inner:
@@ -233,18 +295,15 @@ def generate_estimation(transcription: str) -> EstimationResult:
       [user]      → Transcripción de la reunión a estimar
       [assistant] → Estimación generada por el modelo
 
-    Cacheado en Redis (namespace `estimate:v1`): una transcripción repetida con el
-    mismo proveedor/modelo/system prompt se sirve desde cache sin llamar al LLM.
+    Cacheado en Redis (namespace `estimate:v2`): una transcripción repetida con el
+    mismo modelo primario/system prompt se sirve desde cache sin llamar al LLM.
     """
     system_prompt = build_system_prompt()
-    provider = settings.llm_provider.lower()
-    model = settings.resolved_model
 
     key = cache.build_key(
-        "estimate:v1",
+        "estimate:v2",
         {
-            "provider": provider,
-            "model": model,
+            "primary_model": settings.primary_model,
             "sp_hash": _system_prompt_hash(system_prompt),
             "transcription": transcription,
         },
@@ -258,15 +317,7 @@ def generate_estimation(transcription: str) -> EstimationResult:
             used_tokens=cached["used_tokens"],
         )
 
-    if provider == "openai":
-        result = _call_openai(system_prompt, transcription)
-    elif provider == "anthropic":
-        result = _call_anthropic(system_prompt, transcription)
-    else:
-        raise ValueError(
-            f"Proveedor LLM no soportado: '{settings.llm_provider}'. "
-            "Usa 'openai' o 'anthropic'."
-        )
+    result = _complete(system_prompt, transcription)
 
     cache.set_json(
         key,

@@ -9,6 +9,11 @@ class Settings(BaseSettings):
     llm_provider: str = "openai"
     llm_model: str = ""
 
+    # Router LiteLLM: modelo primario (por defecto) y de fallback, en formato
+    # litellm "<proveedor>/<modelo>".
+    primary_model: str = "anthropic/claude-haiku-4-5"
+    fallback_model: str = "openai/gpt-4o-mini"
+
     redis_url: str = "redis://localhost:6379/0"
     cache_enabled: bool = True
     cache_ttl_seconds: int = 86400  # 24h

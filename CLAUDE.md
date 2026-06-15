@@ -30,11 +30,12 @@ streamlit_app.py ──HTTP──> api_client.py ──> FastAPI (app/)
 
 app/main.py            FastAPI app, /health, mounts router under /api/v1
   └─ routers/estimations.py   3 endpoints (see below); maps ValueError→400, else→502
-       └─ services/llm_service.py   build_system_prompt + provider dispatch
-            ├─ generate_estimation   blocking → EstimationResult   (POST /estimate)
-            └─ stream_estimation     generator yielding text deltas (POST /estimate/stream)
+       └─ services/llm_service.py   build_system_prompt + LiteLLM Router (retry→fallback)
+            ├─ generate_estimation → _complete   blocking → EstimationResult (POST /estimate)
+            ├─ stream_estimation   → _stream      generator yielding deltas  (POST /estimate/stream)
+            ├─ services/cache.py     Redis cache wrapping both (estimate:v2 / estimate-stream:v2)
             ├─ context/examples.py   ESTIMATION_EXAMPLES injected into the prompt (the "CAG")
-            └─ config.py             settings + resolved_model
+            └─ config.py             primary_model / fallback_model + cache settings
   └─ schemas/estimation.py   EstimateRequest (+max_tokens) / EstimateResponse (Pydantic)
 ```
 
@@ -42,15 +43,16 @@ The three endpoints in `routers/estimations.py`: `POST /estimate` (blocking JSON
 
 Key design points to know before editing:
 
-- **Provider dispatch lives in `services/llm_service.py`** (`generate_estimation` → `_call_openai` / `_call_anthropic`). It branches on `settings.llm_provider`. Adding a provider means a new `_call_*` plus a branch here; an unknown provider raises `ValueError`, which the router converts to **400**. Any other failure (bad API key, network, model name) surfaces as **502**.
-- **Model selection is in `config.py::Settings.resolved_model`**: if `LLM_MODEL` is set it wins; otherwise the default depends on provider (`anthropic` → `claude-haiku-4-5`, else → `gpt-4o-mini`). Don't hardcode model names elsewhere.
+- **Provider routing is a LiteLLM `Router` in `services/llm_service.py`** (`_get_router`, used by `_complete` and `_stream`). Anthropic (`PRIMARY_MODEL`) is the default group `"estimador"`; OpenAI (`FALLBACK_MODEL`) is `"estimador-fallback"`. `num_retries=1` + `fallbacks=[{"estimador": ["estimador-fallback"]}]` means: try Anthropic, retry once on transient/connection errors, then fall back to OpenAI. API keys follow the model's provider via `_api_key_for`, so swapping `primary_model`/`fallback_model` never crosses credentials. The served `provider`/`model` is read back from the response (not from config). Any failure after retries+fallback surfaces as **502** at the router.
+- **Streaming fallback has a manual contingency** in `_stream`: it pulls the first chunk inside a `try`; if a connection error fires *before the first delta*, it re-opens forcing `"estimador-fallback"`. This guards against LiteLLM's flaky stream-path fallback. A mid-stream failure (after deltas sent) is not recovered — documented limitation.
+- **Model config is `config.py`: `primary_model` / `fallback_model`** (litellm `"<provider>/<model>"` strings). The legacy `llm_provider`/`llm_model`/`resolved_model` no longer drive routing.
 - **The prompt is the product.** `build_system_prompt()` formats every entry of `ESTIMATION_EXAMPLES` into the system message; the transcription is the only user message. To change estimate style/format/granularity, edit the examples in `app/context/examples.py` or `SYSTEM_PROMPT_TEMPLATE` — not the call sites.
 - **API responses are camelCase over snake_case internals.** `EstimateResponse` uses a Pydantic alias (`used_tokens` ↔ `usedTokens`) with `populate_by_name=True`. Keep that convention for new response fields.
-- **Caching is internal to the service, not the router.** `generate_estimation` and `stream_estimation` wrap their LLM calls with `app/services/cache.py` (Redis), keyed per-endpoint (`estimate:v1:` / `estimate-stream:v1:`) by a sha256 of `{provider, model, sp_hash, transcription[, max_tokens]}`. The `sp_hash` means changing `ESTIMATION_EXAMPLES` auto-invalidates. Two rules when editing the stream path: (1) write to cache **after** the delta loop exhausts cleanly, **never in `finally`** — otherwise a truncated/aborted stream gets cached; (2) `cache.py` must **degrade gracefully** (any Redis error → treat as miss/no-op, never raise) with a short connect timeout + circuit breaker so a down Redis can't slow or break requests.
+- **Caching is internal to the service, not the router.** `generate_estimation` and `stream_estimation` wrap their LLM calls with `app/services/cache.py` (Redis), keyed per-endpoint (`estimate:v2:` / `estimate-stream:v2:`) by a sha256 of `{primary_model, sp_hash, transcription[, max_tokens]}` (keyed on the router's primary model, not the served provider, so a fallback-served response still hits the cache for identical requests). The `sp_hash` means changing `ESTIMATION_EXAMPLES` auto-invalidates. Two rules when editing the stream path: (1) write to cache **after** the delta loop exhausts cleanly, **never in `finally`** — otherwise a truncated/aborted stream gets cached; (2) `cache.py` must **degrade gracefully** (any Redis error → treat as miss/no-op, never raise) with a short connect timeout + circuit breaker so a down Redis can't slow or break requests.
 
 ## Config / environment
 
-Settings come from `.env` via `pydantic-settings` (`extra="ignore"`). Relevant vars: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `LLM_PROVIDER` (`openai` | `anthropic`, default `openai`), `LLM_MODEL` (blank = provider default), and the cache vars `REDIS_URL` (default `redis://localhost:6379/0`), `CACHE_ENABLED` (default `true`), `CACHE_TTL_SECONDS` (default `86400`). The app reads keys eagerly inside the `_call_*` functions, so a missing key fails at request time as a 502, not at startup.
+Settings come from `.env` via `pydantic-settings` (`extra="ignore"`). Relevant vars: `ANTHROPIC_API_KEY` (primary), `OPENAI_API_KEY` (fallback), `PRIMARY_MODEL` (default `anthropic/claude-haiku-4-5`), `FALLBACK_MODEL` (default `openai/gpt-4o-mini`), and the cache vars `REDIS_URL` (default `redis://localhost:6379/0`), `CACHE_ENABLED` (default `true`), `CACHE_TTL_SECONDS` (default `86400`). Keys are passed into the Router at first use, so a missing/invalid key fails at request time as a 502, not at startup. The legacy `LLM_PROVIDER`/`LLM_MODEL` are no longer used for routing.
 
 ## Notes
 

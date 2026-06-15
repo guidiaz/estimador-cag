@@ -44,22 +44,17 @@ cp .env.example .env
 
 | Variable | Descripción |
 |----------|-------------|
-| `OPENAI_API_KEY` | API key de OpenAI (requerida si `LLM_PROVIDER=openai`) |
-| `ANTHROPIC_API_KEY` | API key de Anthropic (requerida si `LLM_PROVIDER=anthropic`) |
-| `LLM_PROVIDER` | `openai` o `anthropic` (por defecto: `openai`) |
-| `LLM_MODEL` | Modelo explícito; si está vacío se usa el predeterminado del proveedor |
+| `ANTHROPIC_API_KEY` | API key de Anthropic (proveedor por defecto del router) |
+| `OPENAI_API_KEY` | API key de OpenAI (proveedor de fallback del router) |
+| `PRIMARY_MODEL` | Modelo por defecto, formato litellm (por defecto `anthropic/claude-haiku-4-5`) |
+| `FALLBACK_MODEL` | Modelo de fallback, formato litellm (por defecto `openai/gpt-4o-mini`) |
 | `APP_ENV` | Entorno de ejecución (opcional) |
 | `LOG_LEVEL` | Nivel de logging (opcional) |
 | `REDIS_URL` | URL de Redis para el cache (por defecto `redis://localhost:6379/0`) |
 | `CACHE_ENABLED` | Activa/desactiva el cache de estimaciones (por defecto `true`) |
 | `CACHE_TTL_SECONDS` | Expiración de las entradas de cache en segundos (por defecto `86400`) |
 
-**Modelos por defecto** (cuando `LLM_MODEL` está vacío):
-
-| Proveedor | Modelo |
-|-----------|--------|
-| `openai` | `gpt-4o-mini` |
-| `anthropic` | `claude-haiku-4-5` |
+> Los antiguos `LLM_PROVIDER` / `LLM_MODEL` ya no gobiernan la elección de proveedor: ahora lo hace el **router LiteLLM** (ver más abajo).
 
 ## Ejecución
 
@@ -152,6 +147,18 @@ También puedes probar el endpoint desde la documentación interactiva en [http:
 3. El modelo devuelve una estimación con desglose de tareas, horas, equipo recomendado y duración.
 
 Para ajustar el comportamiento del estimador, edita o amplía los ejemplos en `app/context/examples.py`.
+
+## Proveedores y fallback (LiteLLM Router)
+
+Las llamadas a `/api/v1/estimate` y `/api/v1/estimate/stream` pasan por un **router de [LiteLLM](https://docs.litellm.ai/docs/routing)**:
+
+- **Proveedor por defecto:** Anthropic (`PRIMARY_MODEL`).
+- **Fallback:** OpenAI (`FALLBACK_MODEL`), que se usa **solo después de que falle un reintento de conexión** al proveedor por defecto. Es decir: se intenta Anthropic → ante un error transitorio (incluida la conexión) se reintenta una vez → si sigue fallando, se sirve con OpenAI.
+- El campo `provider`/`model` de la respuesta (y el registro `done` del stream) refleja el proveedor que **realmente** atendió la petición.
+
+**Limitaciones:**
+- En streaming, el fallback solo está garantizado si el fallo ocurre **antes** del primer token; un fallo a mitad de la generación no se recupera.
+- Un acierto de cache puede reportar el proveedor de fallback aunque el primario ya esté disponible de nuevo.
 
 ## Cache (Redis)
 

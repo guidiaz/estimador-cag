@@ -72,8 +72,9 @@ def create_estimate_stream(request: EstimateRequest) -> StreamingResponse:
 def get_context() -> dict:
     """Contexto estático que alimenta el CAG, para mostrarlo en la UI."""
     return {
-        "provider": settings.llm_provider,
-        "model": settings.resolved_model,
+        "provider": "anthropic (fallback: openai)",
+        "model": settings.primary_model,
+        "fallback_model": settings.fallback_model,
         "system_prompt": build_system_prompt(),
         "examples": ESTIMATION_EXAMPLES,
     }
