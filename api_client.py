@@ -33,6 +33,41 @@ class EstimationError(Exception):
         self.code = code
 
 
+def request_estimation(
+    description: str,
+    project_type: str,
+    detail_level: str,
+    output_format: str,
+) -> dict:
+    """Llama a `POST /api/v1/estimate` (bloqueante) con el contrato estructurado.
+
+    Envía un `EstimationRequest` JSON y devuelve la respuesta como dict
+    (`{"text": ..., "prompt_version": ...}`). Lanza `EstimationError` si la API
+    responde con un error (400 validación de negocio, 422 validación del
+    contrato, 502 fallo del proveedor).
+    """
+    payload = {
+        "description": description,
+        "project_type": project_type,
+        "detail_level": detail_level,
+        "output_format": output_format,
+    }
+    response = httpx.post(
+        f"{API_BASE}/api/v1/estimate", json=payload, timeout=_TIMEOUT
+    )
+    if response.is_error:
+        # FastAPI devuelve `detail` como str (400/502) o como lista de errores
+        # de validación (422). Normalizamos ambos a un texto legible.
+        try:
+            detail = response.json().get("detail", response.text)
+        except (json.JSONDecodeError, ValueError):
+            detail = response.text
+        if not isinstance(detail, str):
+            detail = json.dumps(detail, ensure_ascii=False)
+        raise EstimationError(detail, response.status_code)
+    return response.json()
+
+
 def request_estimation_stream(
     transcription: str, usage_out: dict | None = None, max_tokens: int = 4096
 ) -> Iterator[str]:

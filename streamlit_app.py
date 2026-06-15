@@ -1,4 +1,4 @@
-"""Interfaz de chat Streamlit para el Estimador CAG.
+"""Interfaz Streamlit para el Estimador CAG.
 
 Consume la API del proyecto por HTTP (módulo `api_client`) en lugar de importar
 la lógica del backend en el mismo proceso. Arranca la API por separado:
@@ -8,6 +8,9 @@ la lógica del backend en el mismo proceso. Arranca la API por separado:
 
 La UI apunta a la API mediante la variable de entorno `ESTIMADOR_API_URL`
 (por defecto `http://127.0.0.1:8000`).
+
+El formulario reproduce el contrato `EstimationRequest` del servicio: su envío
+hace `POST /api/v1/estimate` y muestra la estimación (texto libre) que devuelve.
 """
 
 import time
@@ -15,73 +18,112 @@ import time
 import httpx
 import streamlit as st
 
-from api_client import API_BASE, EstimationError, get_context, request_estimation_stream
+from api_client import API_BASE, EstimationError, get_context, request_estimation
+
+# Etiquetas en español ↔ valores del contrato (los enums de `app/schemas.py`).
+PROJECT_TYPES = {
+    "mobile_app": "Aplicación móvil",
+    "web_saas": "Plataforma web SaaS",
+    "internal_tool": "Herramienta interna",
+    "data_pipeline": "Pipeline de datos",
+}
+DETAIL_LEVELS = {
+    "summary": "Resumen",
+    "medium": "Medio",
+    "detailed": "Detallado",
+}
+OUTPUT_FORMATS = {
+    "phases_table": "Tabla de fases",
+    "line_items": "Lista de partidas",
+    "narrative": "Narrativo",
+}
+
+# Límites del contrato (`EstimationRequest.description`), validados también aquí.
+_DESC_MIN = 20
+_DESC_MAX = 2000
 
 st.set_page_config(page_title="Estimador CAG", page_icon="🧮")
 
 st.title("🧮 Estimador CAG")
 st.caption(
-    "Pega o escribe la transcripción de una reunión con el cliente y obtén "
-    "una estimación de software basada en ejemplos previos (CAG)."
+    "Describe el proyecto y elige tipo, nivel de detalle y formato. La estimación "
+    "se genera a partir de ejemplos previos (CAG)."
 )
 
-# Historial de la conversación en el estado de sesión.
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+with st.form("estimation_form"):
+    description = st.text_area(
+        "Descripción del proyecto",
+        height=200,
+        max_chars=_DESC_MAX,
+        placeholder=(
+            "Resume la reunión o describe el proyecto: objetivos, alcance, "
+            "integraciones, plazos…"
+        ),
+        help=f"Entre {_DESC_MIN} y {_DESC_MAX} caracteres.",
+    )
 
-# Pinta el historial existente en cada re-render.
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+    col_type, col_detail, col_format = st.columns(3)
+    project_type = col_type.selectbox(
+        "Tipo de proyecto",
+        options=list(PROJECT_TYPES),
+        format_func=PROJECT_TYPES.get,
+    )
+    detail_level = col_detail.selectbox(
+        "Nivel de detalle",
+        options=list(DETAIL_LEVELS),
+        format_func=DETAIL_LEVELS.get,
+    )
+    output_format = col_format.selectbox(
+        "Formato de salida",
+        options=list(OUTPUT_FORMATS),
+        format_func=OUTPUT_FORMATS.get,
+    )
 
-# Entrada de chat: la transcripción de la reunión.
-transcription = st.chat_input("Escribe o pega aquí la transcripción de la reunión...")
+    submitted = st.form_submit_button("Generar estimación", type="primary")
 
-if transcription:
-    # Mensaje del usuario.
-    st.session_state.messages.append({"role": "user", "content": transcription})
-    with st.chat_message("user"):
-        st.markdown(transcription)
-
-    # Respuesta del asistente: se escribe token a token (streaming vía HTTP).
-    with st.chat_message("assistant"):
-        usage: dict = {}
+if submitted:
+    description = description.strip()
+    if len(description) < _DESC_MIN:
+        st.warning(
+            f"La descripción debe tener al menos {_DESC_MIN} caracteres "
+            f"(actual: {len(description)})."
+        )
+    else:
         try:
-            # st.write_stream consume el generador y va pintando cada delta;
-            # devuelve el texto completo al terminar.
-            # El slider del panel lateral fija el límite de tokens de salida;
-            # su valor persiste en session_state entre re-renders.
-            max_tokens = st.session_state.get("max_tokens", 4096)
             start = time.perf_counter()
-            estimation = st.write_stream(
-                request_estimation_stream(transcription, usage, max_tokens=max_tokens)
-            )
+            with st.spinner("Generando estimación…"):
+                result = request_estimation(
+                    description, project_type, detail_level, output_format
+                )
             elapsed = time.perf_counter() - start
         except httpx.RequestError:
             # No se pudo conectar con la API (backend apagado, URL incorrecta...).
-            error = (
+            st.error(
                 f"⚠️ No se pudo conectar con la API en `{API_BASE}`.\n\n"
                 "Arranca el backend con `uv run uvicorn app.main:app --reload` "
                 "o ajusta la variable `ESTIMADOR_API_URL`."
             )
-            st.error(error)
-            st.session_state.messages.append({"role": "assistant", "content": error})
         except EstimationError as exc:
-            # Error reportado por la API durante la generación (400 / 502).
-            error = f"⚠️ {exc.detail}"
-            st.error(error)
-            st.session_state.messages.append({"role": "assistant", "content": error})
+            # Error reportado por la API (400/422 validación, 502 proveedor).
+            st.error(f"⚠️ {exc.detail}")
         except Exception as exc:  # noqa: BLE001 - cualquier otro fallo inesperado
-            error = f"⚠️ Error al generar la estimación: {exc}"
-            st.error(error)
-            st.session_state.messages.append({"role": "assistant", "content": error})
+            st.error(f"⚠️ Error al generar la estimación: {exc}")
         else:
-            if usage:
-                # Métricas de la última llamada (visibles en el panel lateral).
-                st.session_state.last_metrics = {**usage, "elapsed": elapsed}
-            st.session_state.messages.append(
-                {"role": "assistant", "content": estimation}
-            )
+            st.session_state.last_result = {
+                "text": result.get("text", ""),
+                "prompt_version": result.get("prompt_version", "—"),
+                "elapsed": elapsed,
+            }
+
+# Última estimación generada (persiste entre re-renders del formulario).
+last_result = st.session_state.get("last_result")
+if last_result:
+    st.subheader("Estimación")
+    st.markdown(last_result["text"])
+    st.caption(
+        f"Versión del prompt: `{last_result['prompt_version']}` · "
+        f"{last_result['elapsed']:.2f} s"
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -104,25 +146,11 @@ with st.sidebar:
     else:
         st.warning(f"API no disponible en `{API_BASE}`.")
 
-    st.slider(
-        "Tokens de salida (máx.)",
-        min_value=512,
-        max_value=8192,
-        value=4096,
-        step=512,
-        key="max_tokens",
-        help="Límite de tokens que el modelo puede generar en la respuesta.",
-    )
-
-    # --- Métricas de la última llamada ---
+    # --- Última llamada ---
     st.subheader("📊 Última llamada")
-    metrics = st.session_state.get("last_metrics")
-    if metrics:
-        st.write(f"**Modelo:** `{metrics['model']}`")
-        col_in, col_out = st.columns(2)
-        col_in.metric("Tokens entrada", metrics["input_tokens"])
-        col_out.metric("Tokens salida", metrics["output_tokens"])
-        st.metric("Tiempo de respuesta", f"{metrics['elapsed']:.2f} s")
+    if last_result:
+        st.write(f"**Versión del prompt:** `{last_result['prompt_version']}`")
+        st.metric("Tiempo de respuesta", f"{last_result['elapsed']:.2f} s")
     else:
         st.caption("Aún no hay llamadas en esta sesión.")
 
@@ -147,7 +175,6 @@ with st.sidebar:
                 st.code(example["estimation"].strip(), language="markdown")
 
     st.divider()
-    if st.button("Limpiar conversación"):
-        st.session_state.messages = []
-        st.session_state.pop("last_metrics", None)
+    if st.button("Limpiar resultado"):
+        st.session_state.pop("last_result", None)
         st.rerun()

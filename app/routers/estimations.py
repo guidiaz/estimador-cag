@@ -1,5 +1,4 @@
 import json
-import time
 
 import structlog
 from fastapi import APIRouter, HTTPException
@@ -7,8 +6,13 @@ from fastapi.responses import StreamingResponse
 
 from app.config import settings
 from app.context.examples import ESTIMATION_EXAMPLES
-from app.schemas.estimation import EstimateRequest, EstimateResponse
+from app.schemas import (
+    EstimateRequest,
+    EstimationRequest,
+    EstimationResponse,
+)
 from app.services.llm_service import (
+    PROMPT_VERSION,
     build_system_prompt,
     generate_estimation,
     stream_estimation,
@@ -19,10 +23,10 @@ router = APIRouter(tags=["estimations"])
 logger = structlog.get_logger("app.estimations")
 
 
-@router.post("/estimate", response_model=EstimateResponse)
-def create_estimate(request: EstimateRequest) -> EstimateResponse:
+@router.post("/estimate", response_model=EstimationResponse)
+def create_estimate(request: EstimationRequest) -> EstimationResponse:
     try:
-        result = generate_estimation(request.transcription)
+        result = generate_estimation(request)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -31,13 +35,7 @@ def create_estimate(request: EstimateRequest) -> EstimateResponse:
             detail=f"Error al generar la estimación: {exc}",
         ) from exc
 
-    return EstimateResponse(
-        estimation=result.estimation,
-        model=result.model,
-        provider=result.provider,
-        usedTokens=result.used_tokens,
-        timestamp=int(time.time()),
-    )
+    return EstimationResponse(text=result.estimation, prompt_version=PROMPT_VERSION)
 
 
 @router.post("/estimate/stream")
