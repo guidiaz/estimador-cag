@@ -10,56 +10,18 @@ from litellm import Router
 
 from app.config import settings
 from app.context.examples import ESTIMATION_EXAMPLES
-from app.schemas import (
-    DetailLevel,
-    EstimationRequest,
-    OutputFormat,
-    ProjectType,
-)
+from app.prompts.loader import render_estimation_prompt
+from app.schemas import EstimationRequest
 from app.services import cache
 
 logger = structlog.get_logger("app.llm")
 
-# Versión del prompt estructurado. Se devuelve en la respuesta y entra en la
-# clave de cache: súbela cuando cambien las directivas o el template de abajo
-# para invalidar respuestas previas y poder rastrear con qué prompt se generó
-# cada estimación.
-PROMPT_VERSION = "structured-v1"
-
-# Etiquetas en español para volcar los enums del contrato en directivas de
-# prompt legibles por el modelo.
-_PROJECT_TYPE_ES: dict[ProjectType, str] = {
-    ProjectType.MOBILE_APP: "aplicación móvil",
-    ProjectType.WEB_SAAS: "plataforma web SaaS",
-    ProjectType.INTERNAL_TOOL: "herramienta interna",
-    ProjectType.DATA_PIPELINE: "pipeline de datos",
-}
-
-_DETAIL_LEVEL_ES: dict[DetailLevel, str] = {
-    DetailLevel.SUMMARY: "resumen de alto nivel (pocas líneas, sin desglose fino)",
-    DetailLevel.MEDIUM: "nivel de detalle medio (fases y tareas principales)",
-    DetailLevel.DETAILED: "desglose detallado (tareas, horas y equipo por fase)",
-}
-
-_OUTPUT_FORMAT_ES: dict[OutputFormat, str] = {
-    OutputFormat.PHASES_TABLE: "una tabla Markdown de fases con horas y duración",
-    OutputFormat.LINE_ITEMS: "una lista de partidas (cada tarea con su estimación)",
-    OutputFormat.NARRATIVE: "una explicación narrativa en prosa",
-}
-
-
-def _build_user_message(request: EstimationRequest) -> str:
-    """Vuelca la petición estructurada en el mensaje de usuario, traduciendo los
-    enums a directivas explícitas que guían el estilo y formato de la respuesta."""
-    return (
-        "Genera una estimación de software para el siguiente proyecto, "
-        "respetando estas directivas:\n"
-        f"- Tipo de proyecto: {_PROJECT_TYPE_ES[request.project_type]}.\n"
-        f"- Nivel de detalle: {_DETAIL_LEVEL_ES[request.detail_level]}.\n"
-        f"- Formato de salida: {_OUTPUT_FORMAT_ES[request.output_format]}.\n\n"
-        "## Descripción del proyecto\n"
-        f"{request.description}"
-    )
+# Versión de las plantillas de prompt (directorio `app/prompts/estimation/<v>/`).
+# Se pasa a `render_estimation_prompt`, se devuelve en la respuesta y entra en la
+# clave de cache: súbela (creando el nuevo directorio de plantillas) para
+# invalidar respuestas previas y poder rastrear con qué prompt se generó cada
+# estimación. El resto del código no necesita cambiar al cambiar de versión.
+PROMPT_VERSION = "v1"
 
 
 @dataclass
@@ -370,17 +332,21 @@ def generate_estimation(request: EstimationRequest) -> EstimationResult:
     """
     Genera una estimación de software a partir de una petición estructurada.
 
-    Estructura de mensajes:
-      [system]    → Instrucciones + ejemplos de estimaciones previas (CAG)
-      [user]      → Descripción del proyecto + directivas (tipo / detalle / formato)
+    Estructura de mensajes (dos mensajes con roles separados, no concatenados):
+      [system]    → Plantilla `system.j2`: rol, instrucciones y directivas
+                    condicionales (formato/detalle) + ejemplos few-shot.
+      [user]      → Plantilla `user.j2`: la descripción del proyecto.
       [assistant] → Estimación generada por el modelo
 
-    Cacheado en Redis (namespace `estimate:v2`), con clave derivada de la versión
-    del prompt y de todos los campos del contrato: una petición idéntica con el
-    mismo modelo primario/system prompt se sirve desde cache sin llamar al LLM.
+    El prompt se renderiza con `render_estimation_prompt` desde las plantillas
+    Jinja2 versionadas (`PROMPT_VERSION`). Cacheado en Redis (namespace
+    `estimate:v2`), con clave derivada de la versión del prompt y de todos los
+    campos del contrato: una petición idéntica con el mismo modelo primario se
+    sirve desde cache sin llamar al LLM.
     """
-    system_prompt = build_system_prompt()
-    user_message = _build_user_message(request)
+    system_prompt, user_message = render_estimation_prompt(
+        request, version=PROMPT_VERSION
+    )
 
     key = cache.build_key(
         "estimate:v2",
