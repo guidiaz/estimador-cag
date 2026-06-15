@@ -71,6 +71,11 @@ def render_estimation_prompt(
         "project_type": request.project_type.value,
         "detail_level": request.detail_level.value,
         "output_format": request.output_format.value,
+        # Siempre presente (aunque sea None): con StrictUndefined, un
+        # `{% if reference_projects %}` reventaría si la variable no existiera.
+        # Se pasan los objetos ReferenceProject; las plantillas acceden a sus
+        # atributos (`rp.name`, `rp.total_hours`, …).
+        "reference_projects": request.reference_projects,
     }
     system = env.get_template("system.j2").render(context)
     user = env.get_template("user.j2").render(context)

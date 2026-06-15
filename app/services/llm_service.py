@@ -360,6 +360,15 @@ def generate_estimation(
             "project_type": request.project_type.value,
             "detail_level": request.detail_level.value,
             "output_format": request.output_format.value,
+            # `sp_hash` ya cubre los proyectos de referencia (se renderizan en el
+            # system prompt); lo incluimos explícito por la misma convención que
+            # el resto de campos del contrato. La lista vacía colapsa a None para
+            # compartir clave con «sin referencias».
+            "reference_projects": (
+                [rp.model_dump() for rp in request.reference_projects]
+                if request.reference_projects
+                else None
+            ),
         },
     )
     cached = cache.get_json(key)

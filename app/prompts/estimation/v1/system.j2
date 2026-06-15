@@ -26,6 +26,23 @@ Ofrece un detalle medio: las fases con sus tareas principales y las horas por fa
 Ofrece un desglose detallado: tareas concretas dentro de cada fase, horas por tarea y equipo recomendado. Añade, además, las asunciones por fase: para cada fase, enumera de forma explícita las asunciones en las que se apoya su estimación.
 {% endif %}
 
+{% if reference_projects %}
+## Proyectos de referencia aportados por el cliente
+Estos proyectos similares ya entregados son tu mejor ancla: calibra horas y duración contra ellos, por encima de los ejemplos genéricos de más abajo. No copies sus cifras sin ajustarlas al alcance del proyecto descrito.
+{% for rp in reference_projects %}
+### Referencia {{ loop.index }}: {{ rp.name }}
+{{ rp.description }}
+{% if rp.total_hours %}
+- Horas reales: {{ rp.total_hours }} h
+{% endif %}
+{% if rp.duration %}
+- Duración real: {{ rp.duration }}
+{% endif %}
+{% if rp.notes %}
+- Notas: {{ rp.notes }}
+{% endif %}
+{% endfor %}
+{% endif %}
 Usa los siguientes ejemplos como referencia de estilo, estructura y criterio. No copies sus cifras: adáptalas al proyecto descrito.
 
 {% include "examples.j2" %}

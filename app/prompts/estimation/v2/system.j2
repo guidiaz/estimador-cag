@@ -28,6 +28,23 @@ Desglose detallado: tareas concretas por fase, horas por tarea, equipo recomenda
 
 Cierra SIEMPRE con una última línea «Confianza: alta | media | baja» que refleje cuánto te fías de esta estimación.
 
+{% if reference_projects %}
+## Proyectos de referencia aportados por el cliente
+Trabajo real ya entregado y parecido a este: es tu mejor ancla. Calibra horas, duración y colchón contra estos casos antes que contra los ejemplos genéricos de más abajo, y desconfía si tu estimación se aleja mucho de ellos sin un motivo claro.
+{% for rp in reference_projects %}
+### Referencia {{ loop.index }}: {{ rp.name }}
+{{ rp.description }}
+{% if rp.total_hours %}
+- Horas reales: {{ rp.total_hours }} h
+{% endif %}
+{% if rp.duration %}
+- Duración real: {{ rp.duration }}
+{% endif %}
+{% if rp.notes %}
+- Notas: {{ rp.notes }}
+{% endif %}
+{% endfor %}
+{% endif %}
 Usa estos ejemplos como referencia de estilo y de criterio. No copies sus cifras: adáptalas al proyecto descrito.
 
 {% include "examples.j2" %}

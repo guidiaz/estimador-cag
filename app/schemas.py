@@ -35,6 +35,42 @@ class OutputFormat(str, Enum):
     NARRATIVE = "narrative"
 
 
+class ReferenceProject(BaseModel):
+    """Proyecto similar ya entregado, aportado por el cliente como contexto.
+
+    Sirve de ancla de calibración: permite estimar contra trabajo real (horas y
+    duración efectivas) y no solo contra los ejemplos few-shot inventados del
+    prompt. Todos los campos salvo `name`/`description` son opcionales: el cliente
+    aporta lo que sepa."""
+
+    name: str = Field(
+        min_length=3,
+        max_length=120,
+        description="Nombre o título corto del proyecto de referencia",
+    )
+    description: str = Field(
+        min_length=10,
+        max_length=1000,
+        description="Alcance del proyecto: qué incluía y qué se entregó",
+    )
+    total_hours: int | None = Field(
+        default=None,
+        ge=1,
+        le=100_000,
+        description="Horas reales que costó, si se conocen",
+    )
+    duration: str | None = Field(
+        default=None,
+        max_length=60,
+        description="Duración real (texto libre, p. ej. «8 semanas»)",
+    )
+    notes: str | None = Field(
+        default=None,
+        max_length=500,
+        description="Aprendizajes, sorpresas o riesgos observados",
+    )
+
+
 class EstimationRequest(BaseModel):
     """Petición estructurada del endpoint bloqueante `POST /estimate`."""
 
@@ -46,6 +82,14 @@ class EstimationRequest(BaseModel):
     project_type: ProjectType = Field(description="Tipo de proyecto a estimar")
     detail_level: DetailLevel = Field(description="Granularidad de la estimación")
     output_format: OutputFormat = Field(description="Formato del texto resultante")
+    reference_projects: list[ReferenceProject] | None = Field(
+        default=None,
+        max_length=8,
+        description=(
+            "Proyectos similares previos como contexto de calibración (opcional). "
+            "Se acotan a 8 para no inflar el prompt sin límite."
+        ),
+    )
 
 
 class EstimationResponse(BaseModel):
