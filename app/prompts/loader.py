@@ -10,13 +10,17 @@ argumento `version`: no hay rutas ni nombres de plantilla codificados fuera de
 este módulo, de modo que el resto del código no necesita tocarse.
 """
 
+import hashlib
 import re
 from functools import lru_cache
 from pathlib import Path
 
+import structlog
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from app.schemas import EstimationRequest
+
+logger = structlog.get_logger("app.prompts")
 
 # Anclamos al directorio de este módulo (no al CWD): uvicorn y streamlit arrancan
 # desde directorios distintos, así que solo `__file__` resuelve de forma robusta.
@@ -27,6 +31,16 @@ _ESTIMATION_DIR = Path(__file__).parent / "estimation"
 # nombres simples, sin separadores de ruta ni `..`, antes de tocar el sistema de
 # ficheros.
 _VERSION_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _content_hash(content: str) -> str:
+    """sha256 hexdigest del texto renderizado.
+
+    Mismo cálculo que `_system_prompt_hash` del servicio (no se importa para no
+    crear un ciclo `loader` ↔ `llm_service`), de modo que el `system_hash` que se
+    loguea correlaciona con el `sp_hash` que el servicio usa en la clave de cache.
+    """
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 @lru_cache(maxsize=None)
@@ -79,4 +93,19 @@ def render_estimation_prompt(
     }
     system = env.get_template("system.j2").render(context)
     user = env.get_template("user.j2").render(context)
+
+    # Evento de depuración para producción: identifica de forma unívoca el prompt
+    # generado SIN volcar su contenido (la descripción y las referencias del
+    # cliente no se loguean, solo sus hashes). Permite responder «¿qué plantilla y
+    # qué entrada exactas produjeron esta respuesta?». `system_hash` coincide con
+    # el `sp_hash` de la clave de cache; `user_hash` cambia solo con la
+    # descripción. `reference_count` es metadato seguro del nuevo campo.
+    logger.info(
+        "prompt.rendered",
+        prompt_version=version,
+        system_hash=_content_hash(system),
+        user_hash=_content_hash(user),
+        reference_count=len(request.reference_projects or []),
+    )
+
     return system, user
