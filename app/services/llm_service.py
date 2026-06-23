@@ -1,5 +1,6 @@
 import hashlib
 import itertools
+import json
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from app.context.examples import ESTIMATION_EXAMPLES
 from app.prompts.loader import render_estimation_prompt
 from app.schemas import EstimationRequest
 from app.services import cache
+from app.services.sessions import ProjectMetadata
 
 logger = structlog.get_logger("app.llm")
 
@@ -185,6 +187,97 @@ def generate_from_messages(
     de toda la conversación.
     """
     return _complete_messages(messages, max_tokens=max_tokens)
+
+
+# --- Extracción de metadata de proyecto (segunda llamada al LLM por turno) ---
+#
+# Tras cada respuesta de estimación se hace una segunda llamada que extrae los
+# hechos del proyecto de la interacción y los devuelve como JSON con los campos de
+# `ProjectMetadata`. Delegamos en el LLM (en vez de regex) porque es más fiable y
+# flexible: el prompt se genera a partir del **esquema** de `ProjectMetadata`, así
+# que añadir o cambiar campos no obliga a tocar este código (ver README).
+
+
+def _extraction_messages(
+    current: ProjectMetadata, user_text: str, assistant_text: str
+) -> list[dict]:
+    schema = json.dumps(
+        ProjectMetadata.model_json_schema(), ensure_ascii=False, indent=2
+    )
+    system = (
+        "Eres un extractor de datos de proyectos de software. A partir de la última "
+        "interacción de una conversación de estimación, identificas los hechos del "
+        "proyecto y los devuelves como un único objeto JSON.\n\n"
+        "El JSON debe ajustarse a este esquema (estos y solo estos campos):\n"
+        f"{schema}\n\n"
+        "Reglas:\n"
+        "- Responde SOLO con el objeto JSON, sin texto alrededor y sin vallas ```.\n"
+        "- Rellena un campo solo si hay evidencia explícita en la interacción; si no, "
+        "usa null (y lista vacía para los campos de tipo lista).\n"
+        "- No inventes datos ni copies cifras de ejemplos genéricos.\n"
+        "- En las listas, incluye los elementos mencionados o confirmados.\n\n"
+        "Hechos ya conocidos (contexto; corrígelos solo si la interacción los cambia):\n"
+        f"{current.model_dump_json()}"
+    )
+    user = (
+        "Interacción a analizar:\n\n"
+        f"[Cliente]\n{user_text}\n\n[Estimación generada]\n{assistant_text}"
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def _parse_json_object(raw: str) -> dict:
+    """Extrae el objeto JSON de la respuesta del modelo de forma tolerante.
+
+    Anthropic (proveedor primario) no tiene un modo `json_object` nativo como
+    OpenAI, así que no nos apoyamos en `response_format`: pedimos JSON por prompt y
+    parseamos a la defensiva (quitamos vallas ``` y tomamos el primer `{...}`)."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text[:4].lower() == "json":
+            text = text[4:]
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError("la respuesta no contiene un objeto JSON")
+    return json.loads(text[start : end + 1])
+
+
+def extract_project_metadata(
+    current: ProjectMetadata, user_text: str, assistant_text: str
+) -> ProjectMetadata:
+    """Extrae y funde los hechos del proyecto de la última interacción.
+
+    Hace una segunda llamada al LLM, parsea el JSON, lo valida contra
+    `ProjectMetadata` y lo funde sobre los hechos actuales (`merged_with`).
+
+    **Degrada con elegancia:** cualquier fallo (error del proveedor, respuesta no
+    JSON, validación) se loguea y se devuelve `current` SIN cambios. La estimación
+    ya se entregó al usuario; que la metadata no avance un turno no debe romper la
+    respuesta ni propagar un error."""
+    try:
+        messages = _extraction_messages(current, user_text, assistant_text)
+        raw = _complete_messages(messages, max_tokens=1024).estimation
+        updates = ProjectMetadata.model_validate(_parse_json_object(raw))
+        merged = current.merged_with(updates)
+        logger.info(
+            "session.metadata.extracted",
+            known_fields=[
+                name
+                for name in ProjectMetadata.model_fields
+                if getattr(merged, name) not in (None, "", [])
+            ],
+        )
+        return merged
+    except Exception as exc:  # noqa: BLE001 - la extracción nunca debe romper el turno
+        # Solo el TIPO de error: un ValidationError embebe en str(exc) el
+        # `input_value` (fragmento del contenido extraído), que no debe loguearse.
+        logger.warning("session.metadata.extract_failed", error_type=type(exc).__name__)
+        return current
 
 
 def _best_effort_tokens(captured: dict, messages: list, text: str) -> None:

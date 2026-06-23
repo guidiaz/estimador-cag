@@ -182,6 +182,18 @@ De los adjuntos **extraemos el texto plano nosotros** (`pypdf` para PDF, `python
 
 Solo se admiten formatos con capa de texto. Un PDF escaneado (solo imagen) extrae texto vacío y se ignora ese adjunto; el `.doc` binario antiguo no se soporta (sí el `.docx` moderno).
 
+#### Memoria estructurada del proyecto (`<project_metadata>`)
+
+Cada sesión mantiene, además del hilo de la conversación, una **memoria estructurada** de hechos del proyecto (`ProjectMetadata`: nombre, tamaño de equipo asumido, tecnologías mencionadas, alcance acordado). En cada turno, el system prompt incluye un bloque `<project_metadata>` con los hechos ya conocidos (vacío en la primera interacción), de modo que el modelo es coherente entre turnos y no vuelve a preguntar lo que ya está establecido.
+
+Esa memoria se actualiza **después de cada respuesta** mediante una **segunda llamada al LLM**: un prompt específico que recibe la interacción (transcripción + estimación generada) y devuelve un JSON con los campos de `ProjectMetadata`, que se funde sobre los hechos previos (los escalares nuevos ganan, las listas se unen, lo desconocido no se pisa).
+
+**Por qué delegar la extracción en el LLM y no en expresiones regulares:**
+
+- **Más fiable y sencillo.** Detectar «el equipo será de 4 personas» o «usaremos React y Postgres» en lenguaje natural libre con regex es frágil y costoso de mantener; el LLM lo hace de forma más robusta y con mucho menos código.
+- **Más flexible ante la evolución del modelo de datos.** El prompt de extracción se genera a partir del **propio esquema** de `ProjectMetadata` (`model_json_schema()`), y el bloque del prompt, el parseo y la fusión recorren sus campos de forma genérica. Si más adelante `ProjectMetadata` gana o cambia campos, **no hay que tocar código ni el prompt**: el nuevo campo se extrae, se renderiza y se funde automáticamente.
+- **El coste está justificado.** Es una llamada adicional al LLM por turno, pero a cambio se obtiene una memoria estructurada fiable y mantenible. La extracción es **síncrona** (añade una ronda de latencia) y **degrada con elegancia**: si falla (error del proveedor, respuesta no-JSON, validación), se registra y la metadata simplemente no avanza ese turno, sin afectar a la estimación ya entregada. Si la latencia se volviera un problema, el siguiente paso natural es moverla a un `BackgroundTask` de FastAPI.
+
 ## Cómo funciona (CAG)
 
 ```

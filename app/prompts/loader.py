@@ -18,13 +18,16 @@ from pathlib import Path
 import structlog
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
+from app.context.examples import ESTIMATION_EXAMPLES
 from app.schemas import EstimationRequest
+from app.services.sessions import ProjectMetadata
 
 logger = structlog.get_logger("app.prompts")
 
 # Anclamos al directorio de este módulo (no al CWD): uvicorn y streamlit arrancan
 # desde directorios distintos, así que solo `__file__` resuelve de forma robusta.
 _ESTIMATION_DIR = Path(__file__).parent / "estimation"
+_SESSION_DIR = Path(__file__).parent / "session"
 
 # `version` puede venir de un query param (entrada no confiable) y se usa como
 # nombre de directorio. Validación de entrada / defensa en profundidad: solo
@@ -109,3 +112,63 @@ def render_estimation_prompt(
     )
 
     return system, user
+
+
+@lru_cache(maxsize=None)
+def _session_environment(version: str) -> Environment:
+    """Environment Jinja2 para el system prompt de sesión (`session/<version>/`).
+
+    A diferencia de `render_estimation_prompt`, `version` aquí no viene de entrada
+    de usuario (lo fija el backend), así que se omite la validación antirrecorrido
+    de rutas; basta comprobar que el directorio existe."""
+    version_dir = _SESSION_DIR / version
+    if not version_dir.is_dir():
+        raise ValueError(f"Versión de prompt de sesión desconocida: {version!r}")
+    return Environment(
+        loader=FileSystemLoader(version_dir),
+        undefined=StrictUndefined,
+        trim_blocks=True,
+        lstrip_blocks=True,
+        autoescape=False,
+    )
+
+
+def _metadata_facts(metadata: ProjectMetadata) -> list[dict]:
+    """Convierte la metadata en pares `{name, value}` para el bloque, omitiendo
+    los campos vacíos. Recorre `model_fields` (no nombres codificados): añadir un
+    campo a `ProjectMetadata` aparece en el bloque sin tocar esta función ni la
+    plantilla. Las claves son los nombres de campo del modelo, los mismos que
+    produce la extracción, para que el modelo vea una nomenclatura consistente."""
+    facts: list[dict] = []
+    dumped = metadata.model_dump()
+    for name in type(metadata).model_fields:
+        value = dumped[name]
+        if value in (None, "", []):
+            continue
+        if isinstance(value, list):
+            value = ", ".join(str(v) for v in value)
+        facts.append({"name": name, "value": value})
+    return facts
+
+
+def render_session_system_prompt(
+    metadata: ProjectMetadata, version: str = "v1"
+) -> str:
+    """Renderiza el system prompt del path de sesión con el bloque
+    `<project_metadata>`.
+
+    El bloque lista los hechos ya conocidos del proyecto; si `metadata` está vacía
+    (primera llamada de la sesión), el bloque se renderiza vacío. Incluye además los
+    ejemplos CAG (`ESTIMATION_EXAMPLES`) como referencia de estilo."""
+    env = _session_environment(version)
+    facts = _metadata_facts(metadata)
+    system = env.get_template("system.j2").render(
+        facts=facts, examples=ESTIMATION_EXAMPLES
+    )
+    logger.info(
+        "session.prompt.rendered",
+        prompt_version=version,
+        system_hash=_content_hash(system),
+        known_fields=[f["name"] for f in facts],
+    )
+    return system

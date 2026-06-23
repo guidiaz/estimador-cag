@@ -16,10 +16,12 @@ from app.schemas import (
     SessionEstimationResponse,
     SessionResponse,
 )
+from app.prompts.loader import render_session_system_prompt
 from app.services import documents
 from app.services.llm_service import (
     PROMPT_VERSION,
     build_system_prompt,
+    extract_project_metadata,
     generate_estimation,
     generate_from_messages,
     stream_estimation,
@@ -128,10 +130,14 @@ async def create_session_estimate(
 
     user_content = _build_session_user_content(transcript, extracted)
 
-    # Hilo para la llamada = system (CAG) + turnos previos + el nuevo user. No mutamos
-    # la sesión hasta que la generación tiene éxito: así un 502 no deja un turno de
+    # System prompt de sesión: incluye el bloque <project_metadata> con los hechos
+    # conocidos (vacío en la primera llamada). Se re-renderiza cada turno con la
+    # metadata actualizada del turno anterior.
+    #
+    # Hilo para la llamada = system + turnos previos + el nuevo user. No mutamos la
+    # sesión hasta que la generación tiene éxito: así un 502 no deja un turno de
     # usuario huérfano (sin respuesta) en la memoria.
-    session.history.set_system(build_system_prompt())
+    session.history.set_system(render_session_system_prompt(session.metadata))
     thread = session.history.messages() + [{"role": "user", "content": user_content}]
 
     try:
@@ -147,6 +153,14 @@ async def create_session_estimate(
     session.history.add("user", user_content)
     session.history.add("assistant", result.estimation)
 
+    # Segunda llamada al LLM: extrae los hechos del proyecto de esta interacción y
+    # los funde en la metadata de la sesión, para enriquecer el siguiente turno.
+    # Es síncrona (al threadpool) y degrada con elegancia: un fallo aquí deja la
+    # metadata sin avanzar pero no afecta a la estimación ya generada.
+    session.metadata = await run_in_threadpool(
+        extract_project_metadata, session.metadata, user_content, result.estimation
+    )
+
     logger.info(
         "session.estimate.completed",
         session_id=session_id,
@@ -157,6 +171,11 @@ async def create_session_estimate(
         used_tokens=result.used_tokens,
         transcript_chars=len(transcript),
         extracted_chars=sum(i.extracted_chars for i in infos),
+        known_metadata_fields=[
+            name
+            for name in type(session.metadata).model_fields
+            if getattr(session.metadata, name) not in (None, "", [])
+        ],
     )
 
     return SessionEstimationResponse(

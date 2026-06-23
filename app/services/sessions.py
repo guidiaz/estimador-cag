@@ -67,6 +67,23 @@ class ProjectMetadata(BaseModel):
         description="Alcance acordado hasta ahora, en texto libre",
     )
 
+    def merged_with(self, updates: "ProjectMetadata") -> "ProjectMetadata":
+        """Funde hechos nuevos sobre los actuales, sin perder lo ya sabido.
+
+        Recorre los campos del modelo (no nombres codificados, así añadir un campo
+        nuevo no obliga a tocar este método): los escalares se sobrescriben solo si
+        el valor nuevo es no nulo/no vacío, y las listas se **unen** sin duplicar
+        ni reordenar. Devuelve una instancia nueva (no muta `self`)."""
+        data = self.model_dump()
+        for name in type(self).model_fields:
+            new_value = getattr(updates, name)
+            if isinstance(new_value, list):
+                existing = data.get(name) or []
+                data[name] = list(dict.fromkeys([*existing, *new_value]))
+            elif new_value not in (None, ""):
+                data[name] = new_value
+        return ProjectMetadata(**data)
+
 
 class ConversationHistory:
     """Hilo de mensajes con ventana deslizante que preserva el system prompt.

@@ -35,7 +35,8 @@ def _new_session() -> str:
 
 @pytest.fixture
 def fake_llm(monkeypatch):
-    """Sustituye `generate_from_messages` y captura el hilo que recibe."""
+    """Sustituye las DOS llamadas al LLM del endpoint (generación y extracción de
+    metadata) y captura el hilo que recibe la generación."""
     calls: list[list[dict]] = []
 
     def _fake(messages, max_tokens=4096):
@@ -47,7 +48,14 @@ def fake_llm(monkeypatch):
             used_tokens=123,
         )
 
+    # La extracción no debe llamar al proveedor en los tests: por defecto deja la
+    # metadata como está (los tests que la ejercitan la sobreescriben).
     monkeypatch.setattr(estimations, "generate_from_messages", _fake)
+    monkeypatch.setattr(
+        estimations,
+        "extract_project_metadata",
+        lambda current, user_text, assistant_text: current,
+    )
     return calls
 
 
@@ -115,6 +123,36 @@ def test_turno_se_persiste_en_la_memoria_de_la_sesion(fake_llm):
     )
     history = sessions.get(session_id).history
     assert history.turn_count() == 2
+
+
+def test_metadata_extraida_se_inyecta_en_el_siguiente_turno(monkeypatch):
+    from app.services.sessions import ProjectMetadata
+
+    threads: list[list[dict]] = []
+
+    def _gen(messages, max_tokens=4096):
+        threads.append(messages)
+        return EstimationResult(
+            estimation="estimación", model="m", provider="anthropic", used_tokens=1
+        )
+
+    # El primer turno «descubre» el nombre del proyecto; el segundo debe verlo ya.
+    def _extract(current, user_text, assistant_text):
+        return current.merged_with(ProjectMetadata(project_name="Acme CRM"))
+
+    monkeypatch.setattr(estimations, "generate_from_messages", _gen)
+    monkeypatch.setattr(estimations, "extract_project_metadata", _extract)
+
+    session_id = _new_session()
+    url = f"/api/v1/sessions/{session_id}/estimate"
+    client.post(url, data={"transcript": "Primera reunión."})
+    client.post(url, data={"transcript": "Segunda reunión."})
+
+    first_system = threads[0][0]["content"]
+    second_system = threads[1][0]["content"]
+    # Turno 1: bloque vacío; turno 2: el hecho extraído ya está en el system prompt.
+    assert "project_name: Acme CRM" not in first_system
+    assert "project_name: Acme CRM" in second_system
 
 
 def test_sin_adjuntos_funciona(fake_llm):
