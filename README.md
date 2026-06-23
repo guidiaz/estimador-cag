@@ -77,7 +77,7 @@ uv run uvicorn app.main:app --reload --port 8080
 
 ### Interfaz Streamlit (opcional)
 
-`streamlit_app.py` es un cliente HTTP de la API: un **formulario** (descripción + tipo de proyecto, nivel de detalle y formato) que envía una petición estructurada a `POST /api/v1/estimate` y muestra la estimación. Es un **proceso aparte**; arranca primero la API y luego, en otra terminal:
+`streamlit_app.py` es un cliente HTTP de la API que demuestra el flujo de **sesión con memoria**: al cargar la página crea una sesión (`POST /api/v1/sessions`) y guarda su `session_id`; desde ahí envía cada transcripción —con **documentación adjunta opcional** (PDF/Word)— a `POST /api/v1/sessions/{id}/estimate`. La página separa visualmente el **🧵 historial de conversación** (la memoria del diálogo) de la **🧠 memoria del proyecto** (`project_metadata`, la memoria estructurada que el backend infiere tras cada turno), e incluye un botón **«Nueva conversación»** que crea otra sesión y resetea el estado. Es un **proceso aparte**; arranca primero la API y luego, en otra terminal:
 
 ```bash
 uv run streamlit run streamlit_app.py

@@ -183,6 +183,7 @@ async def create_session_estimate(
         provider=result.provider,
         used_tokens=result.used_tokens,
         attachments=infos,
+        project_metadata=session.metadata,
     )
 
 

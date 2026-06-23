@@ -24,13 +24,30 @@ _TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
 class EstimationError(Exception):
     """Error reportado por la API durante la generación.
 
-    `code` replica el status HTTP equivalente (400 validación, 502 proveedor).
+    `code` replica el status HTTP equivalente (400 validación, 404 sesión
+    inexistente, 502 proveedor).
     """
 
     def __init__(self, detail: str, code: int) -> None:
         super().__init__(detail)
         self.detail = detail
         self.code = code
+
+
+def _raise_for_api_error(response: httpx.Response) -> None:
+    """Convierte una respuesta de error de la API en `EstimationError`.
+
+    FastAPI devuelve `detail` como str (400/404/502) o como lista de errores de
+    validación (422). Se normalizan ambos a un texto legible."""
+    if not response.is_error:
+        return
+    try:
+        detail = response.json().get("detail", response.text)
+    except (json.JSONDecodeError, ValueError):
+        detail = response.text
+    if not isinstance(detail, str):
+        detail = json.dumps(detail, ensure_ascii=False)
+    raise EstimationError(detail, response.status_code)
 
 
 # Mínimos del contrato `ReferenceProject` (app/schemas.py). Se replican aquí para
@@ -136,16 +153,44 @@ def request_estimation(
     response = httpx.post(
         f"{API_BASE}/api/v1/estimate", json=payload, timeout=_TIMEOUT
     )
-    if response.is_error:
-        # FastAPI devuelve `detail` como str (400/502) o como lista de errores
-        # de validación (422). Normalizamos ambos a un texto legible.
-        try:
-            detail = response.json().get("detail", response.text)
-        except (json.JSONDecodeError, ValueError):
-            detail = response.text
-        if not isinstance(detail, str):
-            detail = json.dumps(detail, ensure_ascii=False)
-        raise EstimationError(detail, response.status_code)
+    _raise_for_api_error(response)
+    return response.json()
+
+
+def create_session() -> str:
+    """Llama a `POST /api/v1/sessions` y devuelve el `session_id` (UUID v4).
+
+    Lanza `EstimationError` ante un error de la API y propaga `httpx.RequestError`
+    si no se pudo contactar con el backend."""
+    response = httpx.post(f"{API_BASE}/api/v1/sessions", timeout=_TIMEOUT)
+    _raise_for_api_error(response)
+    return response.json()["session_id"]
+
+
+def request_session_estimate(
+    session_id: str,
+    transcript: str,
+    attachments: list[tuple[str, bytes, str | None]] | None = None,
+) -> dict:
+    """Llama a `POST /api/v1/sessions/{id}/estimate` (multipart).
+
+    `attachments` es una lista de `(filename, contenido_bytes, content_type)`; se
+    omite cuando no hay adjuntos (entonces la petición va como formulario simple).
+    Devuelve la respuesta como dict (incluye `text`, `model`, `provider`,
+    `used_tokens`, `attachments` y `project_metadata`). Lanza `EstimationError`
+    ante un error de la API (404 sesión inexistente, 400 adjunto inválido, 502
+    proveedor); propaga `httpx.RequestError` si no se pudo contactar el backend."""
+    files = [
+        ("attachments", (name, content, content_type or "application/octet-stream"))
+        for name, content, content_type in (attachments or [])
+    ]
+    response = httpx.post(
+        f"{API_BASE}/api/v1/sessions/{session_id}/estimate",
+        data={"transcript": transcript},
+        files=files or None,
+        timeout=_TIMEOUT,
+    )
+    _raise_for_api_error(response)
     return response.json()
 
 

@@ -25,9 +25,11 @@ Two processes: the **Streamlit UI** (`streamlit_app.py`) talks to the **FastAPI 
 
 ```
 streamlit_app.py ──HTTP──> api_client.py ──> FastAPI (app/)
-  UI: st.form + sidebar      POST /api/v1/estimate         (blocking JSON: structured request)
-                             POST /api/v1/estimate/stream  (NDJSON token stream, legacy transcription)
-                             GET  /api/v1/context          (provider/model/system_prompt/examples)
+  UI: session conversation   POST /api/v1/sessions             (mint session_id, on page load)
+      (history vs metadata    POST /api/v1/sessions/{id}/estimate (multipart: transcript + attachments)
+       panels; new-conv btn)  POST /api/v1/estimate             (blocking JSON: structured, programmatic)
+                              POST /api/v1/estimate/stream      (NDJSON token stream, legacy transcription)
+                              GET  /api/v1/context              (provider/model/system_prompt/examples)
 
 app/main.py            FastAPI app, /health, mounts router under /api/v1
   ├─ logging_config.py   configure_logging(): structlog + stdlib bridge (called at import)
@@ -71,4 +73,4 @@ Settings come from `.env` via `pydantic-settings` (`extra="ignore"`). Relevant v
 ## Notes
 
 - All prose, prompts, error messages, and examples are in **Spanish** — match that when extending user-facing strings.
-- `streamlit_app.py` + `api_client.py` are the UI: a Streamlit **form** (`st.form` → structured `EstimationRequest` → `POST /estimate`, rendering the returned free text) that talks to the API over HTTP (see Architecture). Run it as a second process. `api_client.py` exposes both `request_estimation` (blocking, structured) and `request_estimation_stream` (legacy NDJSON); the streaming client is no longer wired into the UI but is kept functional.
+- `streamlit_app.py` + `api_client.py` are the UI: a **session conversation** demo. On page load it mints a session (`create_session` → `POST /sessions`, stored in `st.session_state`), then each turn posts `transcript` + optional file attachments to `POST /sessions/{id}/estimate` (`request_session_estimate`, multipart). It renders the **🧵 historial** (conversation thread) and the **🧠 memoria del proyecto** (`project_metadata`, returned in `SessionEstimationResponse`) as separate panels so the memory/history split is visible, plus a "Nueva conversación" button that mints a fresh session and resets state. A **404** from the estimate call (volatile store lost the session, e.g. backend restart) auto-recreates a session client-side. Run it as a second process. `api_client.py` still exposes `request_estimation` (blocking, structured `POST /estimate` — kept for programmatic use; `test_api_client.py` covers it) and `request_estimation_stream` (legacy NDJSON, functional but not wired into the UI). The structured `st.form` UI was replaced by this session flow.

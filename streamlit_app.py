@@ -1,4 +1,4 @@
-"""Interfaz Streamlit para el Estimador CAG.
+"""Interfaz Streamlit para el Estimador CAG — modo conversación con memoria.
 
 Consume la API del proyecto por HTTP (módulo `api_client`) en lugar de importar
 la lógica del backend en el mismo proceso. Arranca la API por separado:
@@ -9,8 +9,14 @@ la lógica del backend en el mismo proceso. Arranca la API por separado:
 La UI apunta a la API mediante la variable de entorno `ESTIMADOR_API_URL`
 (por defecto `http://127.0.0.1:8000`).
 
-El formulario reproduce el contrato `EstimationRequest` del servicio: su envío
-hace `POST /api/v1/estimate` y muestra la estimación (texto libre) que devuelve.
+Esta página demuestra el flujo de **sesión** (`POST /sessions` + `POST
+/sessions/{id}/estimate`): al cargar crea una sesión, permite enviar una
+transcripción con documentación adjunta opcional, y muestra por separado el
+**historial** del diálogo (la memoria conversacional) y la **memoria del
+proyecto** (`project_metadata`, la memoria estructurada que el backend infiere
+tras cada turno). El formulario estructurado de `POST /estimate` ya no se expone
+aquí, pero el endpoint y `api_client.request_estimation` siguen disponibles para
+uso programático.
 """
 
 import time
@@ -18,219 +24,182 @@ import time
 import httpx
 import streamlit as st
 
-from api_client import (
-    API_BASE,
-    EstimationError,
-    build_reference_projects,
-    get_context,
-    request_estimation,
-)
+import api_client
+from api_client import API_BASE, EstimationError
 
-# Etiquetas en español ↔ valores del contrato (los enums de `app/schemas.py`).
-PROJECT_TYPES = {
-    "mobile_app": "Aplicación móvil",
-    "web_saas": "Plataforma web SaaS",
-    "internal_tool": "Herramienta interna",
-    "data_pipeline": "Pipeline de datos",
-}
-DETAIL_LEVELS = {
-    "summary": "Resumen",
-    "medium": "Medio",
-    "detailed": "Detallado",
-}
-OUTPUT_FORMATS = {
-    "phases_table": "Tabla de fases",
-    "line_items": "Lista de partidas",
-    "narrative": "Narrativo",
+# Límites del contrato del endpoint de sesión (`app/services/documents.py`), que
+# replicamos en la UI para avisar antes de llegar a la API (mismo criterio que el
+# resto de validaciones cliente del proyecto).
+_MAX_ATTACHMENTS = 8
+_ALLOWED_EXTS = ["pdf", "docx"]
+
+# Etiquetas legibles de los campos de `ProjectMetadata` (las claves del dict son
+# los nombres de campo del modelo); si aparece un campo nuevo, cae al propio nombre.
+_METADATA_LABELS = {
+    "project_name": "Nombre del proyecto",
+    "assumed_team_size": "Tamaño de equipo asumido",
+    "mentioned_technologies": "Tecnologías mencionadas",
+    "agreed_scope": "Alcance acordado",
 }
 
-# Límites del contrato (`EstimationRequest.description`), validados también aquí.
-_DESC_MIN = 20
-_DESC_MAX = 2000
+st.set_page_config(page_title="Estimador CAG — Sesión", page_icon="🧮")
 
-# Tope de proyectos de referencia (`EstimationRequest.reference_projects`,
-# `max_length=8`): se valida en la UI para no enviar una petición que la API
-# rechazaría con 422.
-_REF_MAX = 8
 
-st.set_page_config(page_title="Estimador CAG", page_icon="🧮")
+def _start_new_session() -> None:
+    """Crea una sesión nueva y resetea el estado conversacional de la página."""
+    st.session_state.session_id = api_client.create_session()
+    st.session_state.turns = []
+    st.session_state.project_metadata = {}
 
-st.title("🧮 Estimador CAG")
+
+def _ensure_session() -> None:
+    """Garantiza una sesión al cargar la página (una sola vez por carga)."""
+    if "session_id" not in st.session_state:
+        _start_new_session()
+
+
+# La sesión debe existir antes de renderizar el input. Si la API no está disponible
+# al cargar, paramos con un mensaje claro en lugar de operar con estado a medias.
+try:
+    _ensure_session()
+except httpx.RequestError:
+    st.error(
+        f"⚠️ No se pudo conectar con la API en `{API_BASE}`.\n\n"
+        "Arranca el backend con `uv run uvicorn app.main:app --reload` "
+        "o ajusta la variable `ESTIMADOR_API_URL`."
+    )
+    st.stop()
+except EstimationError as exc:
+    st.error(f"⚠️ No se pudo crear la sesión: {exc.detail}")
+    st.stop()
+
+
+def _render_metadata(metadata: dict) -> None:
+    """Panel de la memoria estructurada del proyecto (`project_metadata`)."""
+    has_data = any(v not in (None, "", []) for v in (metadata or {}).values())
+    if not has_data:
+        st.caption(
+            "Aún vacía. El backend la irá rellenando tras cada turno extrayendo "
+            "los hechos del proyecto de la conversación."
+        )
+        return
+    for key, value in metadata.items():
+        if value in (None, "", []):
+            continue
+        label = _METADATA_LABELS.get(key, key)
+        if isinstance(value, list):
+            value = ", ".join(str(v) for v in value)
+        st.markdown(f"**{label}:** {value}")
+
+
+st.title("🧮 Estimador CAG — Conversación")
 st.caption(
-    "Describe el proyecto y elige tipo, nivel de detalle y formato. La estimación "
-    "se genera a partir de ejemplos previos (CAG)."
+    "Envía la transcripción de la reunión (con documentación adjunta opcional) y "
+    "el modelo estima en el contexto de la sesión. El historial y la memoria del "
+    "proyecto se mantienen entre turnos."
 )
 
-with st.form("estimation_form"):
-    description = st.text_area(
-        "Descripción del proyecto",
-        height=200,
-        max_chars=_DESC_MAX,
-        placeholder=(
-            "Resume la reunión o describe el proyecto: objetivos, alcance, "
-            "integraciones, plazos…"
-        ),
-        help=f"Entre {_DESC_MIN} y {_DESC_MAX} caracteres.",
-    )
+# --- Historial del diálogo (la memoria conversacional) ---
+st.subheader("🧵 Historial de conversación")
+if not st.session_state.turns:
+    st.caption("Aún no hay turnos. Envía la primera transcripción más abajo.")
+for turn in st.session_state.turns:
+    with st.chat_message("user"):
+        st.markdown(turn["transcript"])
+        if turn["attachments"]:
+            st.caption("📎 " + ", ".join(turn["attachments"]))
+    with st.chat_message("assistant"):
+        st.markdown(turn["estimation"])
+        st.caption(
+            f"{turn['provider']} · `{turn['model']}` · "
+            f"{turn['used_tokens']} tokens · {turn['elapsed']:.2f} s"
+        )
 
-    col_type, col_detail, col_format = st.columns(3)
-    project_type = col_type.selectbox(
-        "Tipo de proyecto",
-        options=list(PROJECT_TYPES),
-        format_func=PROJECT_TYPES.get,
+# --- Entrada de un nuevo turno ---
+with st.form("session_turn_form", clear_on_submit=True):
+    transcript = st.text_area(
+        "Transcripción de la reunión",
+        height=180,
+        placeholder="Pega o escribe la transcripción / resumen de la reunión…",
     )
-    detail_level = col_detail.selectbox(
-        "Nivel de detalle",
-        options=list(DETAIL_LEVELS),
-        format_func=DETAIL_LEVELS.get,
+    uploaded = st.file_uploader(
+        "Documentación adjunta (opcional)",
+        type=_ALLOWED_EXTS,
+        accept_multiple_files=True,
+        help=f"PDF o Word .docx · máximo {_MAX_ATTACHMENTS} archivos.",
     )
-    output_format = col_format.selectbox(
-        "Formato de salida",
-        options=list(OUTPUT_FORMATS),
-        format_func=OUTPUT_FORMATS.get,
-    )
-
-    st.markdown("**Proyectos de referencia** (opcional)")
-    st.caption(
-        "Proyectos similares ya entregados que sirvan de ancla para calibrar la "
-        f"estimación. Nombre y descripción son obligatorios; máximo {_REF_MAX}."
-    )
-    # Sembramos una fila vacía: garantiza que las columnas se rendericen en
-    # cualquier versión de Streamlit y las filas en blanco se descartan al enviar.
-    reference_rows = st.data_editor(
-        [{"name": None, "description": None, "total_hours": None,
-          "duration": None, "notes": None}],
-        num_rows="dynamic",
-        hide_index=True,
-        width="stretch",
-        column_config={
-            "name": st.column_config.TextColumn("Nombre", max_chars=120),
-            "description": st.column_config.TextColumn(
-                "Descripción", max_chars=1000, width="large"
-            ),
-            "total_hours": st.column_config.NumberColumn(
-                "Horas reales", min_value=1, max_value=100_000, step=1, format="%d"
-            ),
-            "duration": st.column_config.TextColumn("Duración", max_chars=60),
-            "notes": st.column_config.TextColumn("Notas", max_chars=500),
-        },
-        key="reference_projects_editor",
-    )
-
     submitted = st.form_submit_button("Generar estimación", type="primary")
 
 if submitted:
-    description = description.strip()
-    reference_projects, ref_problems = build_reference_projects(reference_rows)
+    transcript = (transcript or "").strip()
+    uploaded = uploaded or []
 
-    # Validamos en bloque (descripción + referencias) antes de llamar a la API.
-    errors = []
-    if len(description) < _DESC_MIN:
-        errors.append(
-            f"La descripción debe tener al menos {_DESC_MIN} caracteres "
-            f"(actual: {len(description)})."
+    if not transcript:
+        st.warning("Escribe la transcripción de la reunión antes de enviar.")
+    elif len(uploaded) > _MAX_ATTACHMENTS:
+        st.warning(
+            f"Como máximo {_MAX_ATTACHMENTS} adjuntos (tienes {len(uploaded)})."
         )
-    errors.extend(ref_problems)
-    if len(reference_projects) > _REF_MAX:
-        errors.append(
-            f"Como máximo {_REF_MAX} proyectos de referencia "
-            f"(tienes {len(reference_projects)}). Quita algunos."
-        )
-
-    if errors:
-        for message in errors:
-            st.warning(message)
     else:
+        attachments = [(f.name, f.getvalue(), f.type) for f in uploaded]
         try:
             start = time.perf_counter()
             with st.spinner("Generando estimación…"):
-                result = request_estimation(
-                    description,
-                    project_type,
-                    detail_level,
-                    output_format,
-                    reference_projects=reference_projects or None,
+                resp = api_client.request_session_estimate(
+                    st.session_state.session_id, transcript, attachments or None
                 )
             elapsed = time.perf_counter() - start
         except httpx.RequestError:
-            # No se pudo conectar con la API (backend apagado, URL incorrecta...).
             st.error(
-                f"⚠️ No se pudo conectar con la API en `{API_BASE}`.\n\n"
-                "Arranca el backend con `uv run uvicorn app.main:app --reload` "
-                "o ajusta la variable `ESTIMADOR_API_URL`."
+                f"⚠️ No se pudo conectar con la API en `{API_BASE}`. "
+                "¿Está arrancado el backend?"
             )
         except EstimationError as exc:
-            # Error reportado por la API (400/422 validación, 502 proveedor).
-            st.error(f"⚠️ {exc.detail}")
-        except Exception as exc:  # noqa: BLE001 - cualquier otro fallo inesperado
-            st.error(f"⚠️ Error al generar la estimación: {exc}")
+            if exc.code == 404:
+                # La sesión se perdió (almacén volátil: reinicio del backend).
+                # Recreamos una limpia para que el alumno pueda seguir sin atascarse.
+                _start_new_session()
+                st.warning(
+                    "Tu sesión ya no existe en el servidor (probablemente se "
+                    "reinició). He empezado una conversación nueva: vuelve a enviar."
+                )
+                st.rerun()
+            else:
+                st.error(f"⚠️ {exc.detail}")
         else:
-            st.session_state.last_result = {
-                "text": result.get("text", ""),
-                "prompt_version": result.get("prompt_version", "—"),
-                "elapsed": elapsed,
-            }
-
-# Última estimación generada (persiste entre re-renders del formulario).
-last_result = st.session_state.get("last_result")
-if last_result:
-    st.subheader("Estimación")
-    st.markdown(last_result["text"])
-    st.caption(
-        f"Versión del prompt: `{last_result['prompt_version']}` · "
-        f"{last_result['elapsed']:.2f} s"
-    )
-
-
-@st.cache_data(show_spinner=False)
-def _load_context() -> dict:
-    """Contexto estático del backend (cacheado: no cambia entre llamadas)."""
-    return get_context()
-
-
-with st.sidebar:
-    st.subheader("⚙️ Configuración")
-
-    try:
-        ctx = _load_context()
-    except Exception:  # noqa: BLE001 - API no disponible al cargar el panel
-        ctx = None
-
-    if ctx:
-        st.write(f"**Proveedor:** `{ctx['provider']}`")
-        st.write(f"**Modelo:** `{ctx['model']}`")
-    else:
-        st.warning(f"API no disponible en `{API_BASE}`.")
-
-    # --- Última llamada ---
-    st.subheader("📊 Última llamada")
-    if last_result:
-        st.write(f"**Versión del prompt:** `{last_result['prompt_version']}`")
-        st.metric("Tiempo de respuesta", f"{last_result['elapsed']:.2f} s")
-    else:
-        st.caption("Aún no hay llamadas en esta sesión.")
-
-    # --- Contexto CAG inyectado en el system prompt (vía GET /context) ---
-    if ctx:
-        st.subheader("🧠 Contexto CAG")
-
-        with st.expander("System prompt activo (solo lectura)"):
-            st.text_area(
-                "System prompt",
-                value=ctx["system_prompt"],
-                height=300,
-                disabled=True,
-                label_visibility="collapsed",
+            st.session_state.turns.append(
+                {
+                    "transcript": transcript,
+                    "attachments": [a[0] for a in attachments],
+                    "estimation": resp.get("text", ""),
+                    "model": resp.get("model", "—"),
+                    "provider": resp.get("provider", "—"),
+                    "used_tokens": resp.get("used_tokens", 0),
+                    "elapsed": elapsed,
+                }
             )
+            st.session_state.project_metadata = resp.get("project_metadata") or {}
+            st.rerun()
 
-        with st.expander(f"Estimaciones de ejemplo ({len(ctx['examples'])})"):
-            for index, example in enumerate(ctx["examples"], start=1):
-                st.markdown(f"**Ejemplo {index} — resumen de la reunión:**")
-                st.caption(example["meeting_summary"])
-                st.markdown("**Estimación generada:**")
-                st.code(example["estimation"].strip(), language="markdown")
+# --- Barra lateral: memoria del proyecto + control de sesión ---
+with st.sidebar:
+    st.subheader("🧠 Memoria del proyecto")
+    st.caption(
+        "Memoria **estructurada** (`project_metadata`): los hechos que el backend "
+        "infiere y conserva entre turnos, distinta del historial del diálogo."
+    )
+    _render_metadata(st.session_state.project_metadata)
 
     st.divider()
-    if st.button("Limpiar resultado"):
-        st.session_state.pop("last_result", None)
-        st.rerun()
+    if st.button("🆕 Nueva conversación", type="primary", width="stretch"):
+        try:
+            _start_new_session()
+        except httpx.RequestError:
+            st.error(f"No se pudo contactar la API en `{API_BASE}`.")
+        except EstimationError as exc:
+            st.error(f"No se pudo crear la sesión: {exc.detail}")
+        else:
+            st.rerun()
+
+    st.caption(f"Sesión actual: `{st.session_state.get('session_id', '—')}`")
+    st.caption(f"Turnos en el historial: {len(st.session_state.turns)}")

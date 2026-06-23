@@ -92,6 +92,14 @@ def test_estimacion_con_adjunto_docx(fake_llm):
     assert body["attachments"] == [
         {"filename": "reqs.docx", "extracted_chars": len("Requisito: panel de KPIs con SSO.")}
     ]
+    # La respuesta incluye la memoria estructurada del proyecto (vacía aquí: el
+    # `fake_llm` deja la extracción como identidad).
+    assert body["project_metadata"] == {
+        "project_name": None,
+        "assumed_team_size": None,
+        "mentioned_technologies": [],
+        "agreed_scope": None,
+    }
 
     # El hilo enviado al modelo incluye el system (CAG) y el texto extraído del adjunto.
     thread = fake_llm[0]
@@ -154,6 +162,33 @@ def test_metadata_extraida_se_inyecta_en_el_siguiente_turno(monkeypatch):
     # Turno 1: bloque vacío; turno 2: el hecho extraído ya está en el system prompt.
     assert "project_name: Acme CRM" not in first_system
     assert "project_name: Acme CRM" in second_system
+
+
+def test_la_respuesta_refleja_la_metadata_extraida(monkeypatch):
+    from app.services.sessions import ProjectMetadata
+
+    def _gen(messages, max_tokens=4096):
+        return EstimationResult(
+            estimation="est", model="m", provider="anthropic", used_tokens=1
+        )
+
+    def _extract(current, user_text, assistant_text):
+        return current.merged_with(
+            ProjectMetadata(project_name="Acme CRM", mentioned_technologies=["React"])
+        )
+
+    monkeypatch.setattr(estimations, "generate_from_messages", _gen)
+    monkeypatch.setattr(estimations, "extract_project_metadata", _extract)
+
+    session_id = _new_session()
+    resp = client.post(
+        f"/api/v1/sessions/{session_id}/estimate",
+        data={"transcript": "Reunión con Acme sobre su CRM en React."},
+    )
+
+    meta = resp.json()["project_metadata"]
+    assert meta["project_name"] == "Acme CRM"
+    assert meta["mentioned_technologies"] == ["React"]
 
 
 def test_sin_adjuntos_funciona(fake_llm):

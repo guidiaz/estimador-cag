@@ -163,3 +163,53 @@ def test_request_estimation_omite_reference_projects_cuando_vacio(monkeypatch):
 
     request_estimation("una descripción válida y larga", "web_saas", "medium", "narrative")
     assert "reference_projects" not in captured["json"]
+
+
+# --- create_session / request_session_estimate -------------------------------
+
+
+def _patch_post(monkeypatch, return_json: dict) -> dict:
+    """Sustituye httpx.post (firma flexible) y recoge url + kwargs de la llamada."""
+    captured: dict = {}
+
+    class _Resp:
+        is_error = False
+
+        def json(self) -> dict:
+            return return_json
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return _Resp()
+
+    monkeypatch.setattr(api_client.httpx, "post", fake_post)
+    return captured
+
+
+def test_create_session_devuelve_session_id(monkeypatch):
+    captured = _patch_post(monkeypatch, {"session_id": "abc-123"})
+    assert api_client.create_session() == "abc-123"
+    assert captured["url"].endswith("/api/v1/sessions")
+
+
+def test_request_session_estimate_sin_adjuntos_no_envia_files(monkeypatch):
+    captured = _patch_post(monkeypatch, {"text": "ok"})
+    api_client.request_session_estimate("sid-1", "transcripción")
+    assert captured["url"].endswith("/api/v1/sessions/sid-1/estimate")
+    assert captured["data"] == {"transcript": "transcripción"}
+    assert captured["files"] is None  # sin adjuntos: formulario simple, no multipart
+
+
+def test_request_session_estimate_construye_multipart_de_adjuntos(monkeypatch):
+    captured = _patch_post(monkeypatch, {"text": "ok"})
+    api_client.request_session_estimate(
+        "sid-1",
+        "t",
+        [("a.pdf", b"%PDF", "application/pdf"), ("b.docx", b"PK", None)],
+    )
+    # El content_type ausente cae a un valor por defecto seguro.
+    assert captured["files"] == [
+        ("attachments", ("a.pdf", b"%PDF", "application/pdf")),
+        ("attachments", ("b.docx", b"PK", "application/octet-stream")),
+    ]

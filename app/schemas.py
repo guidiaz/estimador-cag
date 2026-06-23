@@ -15,6 +15,8 @@ from enum import Enum
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.services.sessions import ProjectMetadata
+
 
 class ProjectType(str, Enum):
     MOBILE_APP = "mobile_app"
@@ -135,6 +137,12 @@ class SessionEstimationResponse(BaseModel):
     provider: str
     used_tokens: int
     attachments: list[AttachmentInfo] = Field(default_factory=list)
+    project_metadata: ProjectMetadata = Field(
+        description=(
+            "Memoria estructurada del proyecto DESPUÉS de este turno (ya incluye los "
+            "hechos extraídos de esta interacción), la que alimentará el siguiente turno."
+        )
+    )
 
 
 # --- Contrato heredado: endpoint de streaming `POST /estimate/stream` ---
