@@ -25,9 +25,13 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=9.1.0",
+    "pytest-asyncio>=0.24.0",
 ]
 
 [tool.pytest.ini_options]
 # Pone la raíz del repo en sys.path para que `from app...` resuelva en los tests.
 pythonpath = ["."]
 testpaths = ["tests"]
+# Las funciones `async def test_*` se ejecutan como tests asyncio sin marca explícita
+# (los tests de integración usan httpx.AsyncClient).
+asyncio_mode = "auto"
