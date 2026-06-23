@@ -25,9 +25,15 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from app.config import settings
+
 # Roles válidos en el hilo, alineados con el contrato de mensajes de LiteLLM/OpenAI
 # (`{"role": ..., "content": ...}`), que es lo que consume la capa LLM.
 Role = str  # "system" | "user" | "assistant"
+
+# Tamaño por defecto de la ventana deslizante, en turnos (un turno = un par
+# user+assistant). Vale 6 salvo que se ajuste por configuración (`SESSION_MAX_TURNS`).
+MAX_TURNS = settings.session_max_turns
 
 
 class Message(BaseModel):
@@ -86,50 +92,52 @@ class ProjectMetadata(BaseModel):
 
 
 class ConversationHistory:
-    """Hilo de mensajes con ventana deslizante que preserva el system prompt.
+    """Ventana deslizante de turnos `user`/`assistant`.
 
-    El system prompt (rol `system`) es el contrato con el modelo y nunca debe
-    caducar: se guarda aparte y siempre encabeza el hilo. El resto de mensajes
-    (`user`/`assistant`) forman una ventana acotada a `max_turns`; al superarla se
-    descartan los turnos más antiguos. Aquí un *turno* es un intercambio: cada
-    mensaje `user` abre uno y el `assistant` que le sigue lo cierra. El recorte
-    razona en turnos —no en mensajes sueltos— para no separar nunca una respuesta
-    de su pregunta y para dejar el último turno en curso (un `user` aún sin
-    respuesta) intacto.
+    Solo almacena los turnos del diálogo. Un *turno* es un par: cada mensaje
+    `user` lo abre y el `assistant` que le sigue lo cierra. La ventana se acota a
+    `max_turns` (por defecto `MAX_TURNS`); al superarse se descartan los **pares
+    más antiguos**. El recorte razona en turnos —no en mensajes sueltos— para no
+    separar nunca una respuesta de su pregunta y para dejar el último turno en
+    curso (un `user` aún sin respuesta) intacto.
+
+    **El system prompt no se almacena aquí.** Es invariante (siempre presente en la
+    salida) pero se *regenera* en cada `to_messages_list`: así refleja siempre el
+    `project_metadata` más reciente y nunca queda obsoleto. Por eso esta clase no
+    importa el renderizador (vive en `prompts/loader.py`, que sí depende de este
+    módulo): el llamante le pasa el system prompt ya renderizado.
 
     No es un Pydantic model porque su valor está en el comportamiento (añadir y
     recortar), no en la validación de un payload de entrada/salida.
     """
 
-    def __init__(self, max_turns: int = 10) -> None:
+    def __init__(self, max_turns: int = MAX_TURNS) -> None:
         if max_turns < 1:
             raise ValueError("max_turns debe ser >= 1")
         self.max_turns = max_turns
-        self._system: Message | None = None
         self._messages: list[Message] = []
 
-    def set_system(self, content: str) -> None:
-        """Fija (o reemplaza) el system prompt. Queda fuera de la ventana."""
-        self._system = Message(role="system", content=content)
-
     def add(self, role: Role, content: str) -> None:
-        """Añade un mensaje. Un `system` reemplaza el prompt; el resto entra a la
-        ventana y dispara el recorte de los más antiguos si se supera `max_turns`.
-        """
+        """Añade un mensaje `user` o `assistant` y recorta la ventana si procede.
+
+        El rol `system` no se acepta: el system prompt no se almacena, se regenera
+        en `to_messages_list`."""
         if role == "system":
-            self.set_system(content)
-            return
+            raise ValueError(
+                "El system prompt no se almacena en el historial; se regenera en "
+                "to_messages_list a partir del project_metadata."
+            )
         self._messages.append(Message(role=role, content=content))
         self._trim()
 
     def _trim(self) -> None:
-        """Mantiene solo los `max_turns` turnos más recientes de la ventana.
+        """Mantiene solo los `max_turns` turnos (pares) más recientes.
 
         Cada mensaje `user` marca el inicio de un turno. Si hay más turnos que
         `max_turns`, cortamos justo en el `user` que abre el turno más antiguo
         que debe permanecer, descartando todo lo anterior. Así nunca se separa un
-        `assistant` de su `user` y un `user` sin respuesta todavía cuenta como el
-        turno en curso. El system prompt no vive aquí, así que no se ve afectado.
+        `assistant` de su `user`, un `user` sin respuesta cuenta como el turno en
+        curso y la ventana jamás empieza por un `assistant` huérfano.
         """
         user_positions = [i for i, m in enumerate(self._messages) if m.role == "user"]
         if len(user_positions) <= self.max_turns:
@@ -137,16 +145,26 @@ class ConversationHistory:
         start = user_positions[-self.max_turns]
         self._messages = self._messages[start:]
 
-    def messages(self) -> list[dict[str, str]]:
-        """Devuelve el hilo listo para la capa LLM: system (si existe) + ventana."""
-        thread: list[Message] = []
-        if self._system is not None:
-            thread.append(self._system)
-        thread.extend(self._messages)
-        return [m.model_dump() for m in thread]
+    def to_messages_list(
+        self, system_prompt: str, pending_user: str | None = None
+    ) -> list[dict[str, str]]:
+        """Devuelve el array `messages` listo para la API del LLM.
+
+        Antepone `system_prompt` (invariante, siempre presente) a la ventana de
+        turnos. `system_prompt` lo aporta ya renderizado el llamante, que lo
+        regenera en cada llamada a partir del `project_metadata` actual de la
+        sesión; como no se almacena, nunca queda obsoleto. Si se pasa
+        `pending_user`, se añade como turno `user` final (el que está a punto de
+        responderse) **sin** mutar el historial: así la lista queda completa para
+        enviar sin dejar un turno huérfano si la generación falla."""
+        thread: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+        thread.extend(m.model_dump() for m in self._messages)
+        if pending_user is not None:
+            thread.append({"role": "user", "content": pending_user})
+        return thread
 
     def __len__(self) -> int:
-        """Número de mensajes en la ventana (sin contar el system prompt)."""
+        """Número de mensajes en la ventana (los turnos `user`/`assistant`)."""
         return len(self._messages)
 
     def turn_count(self) -> int:
@@ -162,7 +180,7 @@ class Session:
     `session_id`. Es el objeto que `SessionStore` indexa en memoria.
     """
 
-    def __init__(self, session_id: str, max_turns: int = 10) -> None:
+    def __init__(self, session_id: str, max_turns: int = MAX_TURNS) -> None:
         self.session_id = session_id
         self.history = ConversationHistory(max_turns=max_turns)
         self.metadata = ProjectMetadata()
@@ -177,7 +195,7 @@ class SessionStore:
     cambiar a sus consumidores.
     """
 
-    def __init__(self, max_turns: int = 10) -> None:
+    def __init__(self, max_turns: int = MAX_TURNS) -> None:
         self._max_turns = max_turns
         self._sessions: dict[str, Session] = {}
 

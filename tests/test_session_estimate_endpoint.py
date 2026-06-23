@@ -113,7 +113,8 @@ def test_turno_se_persiste_en_la_memoria_de_la_sesion(fake_llm):
 
     history = sessions.get(session_id).history
     assert history.turn_count() == 1  # un intercambio user+assistant
-    roles = [m["role"] for m in history.messages()]
+    # El system se regenera al construir la lista; la ventana guarda user+assistant.
+    roles = [m["role"] for m in history.to_messages_list("SYS")]
     assert roles == ["system", "user", "assistant"]
 
     # Un segundo turno se acumula sobre el primero (memoria multi-turno).

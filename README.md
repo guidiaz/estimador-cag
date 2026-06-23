@@ -57,6 +57,7 @@ cp .env.example .env
 | `REDIS_URL` | URL de Redis para el cache (por defecto `redis://localhost:6379/0`) |
 | `CACHE_ENABLED` | Activa/desactiva el cache de estimaciones (por defecto `true`) |
 | `CACHE_TTL_SECONDS` | Expiración de las entradas de cache en segundos (por defecto `86400`) |
+| `SESSION_MAX_TURNS` | Tamaño de la ventana deslizante de memoria de sesión, en turnos (un turno = par user+assistant; por defecto `6`) |
 
 > Los antiguos `LLM_PROVIDER` / `LLM_MODEL` ya no gobiernan la elección de proveedor: ahora lo hace el **router LiteLLM** (ver más abajo).
 
@@ -185,6 +186,8 @@ Solo se admiten formatos con capa de texto. Un PDF escaneado (solo imagen) extra
 #### Memoria estructurada del proyecto (`<project_metadata>`)
 
 Cada sesión mantiene, además del hilo de la conversación, una **memoria estructurada** de hechos del proyecto (`ProjectMetadata`: nombre, tamaño de equipo asumido, tecnologías mencionadas, alcance acordado). En cada turno, el system prompt incluye un bloque `<project_metadata>` con los hechos ya conocidos (vacío en la primera interacción), de modo que el modelo es coherente entre turnos y no vuelve a preguntar lo que ya está establecido.
+
+El hilo del diálogo se acota con una **ventana deslizante** de `SESSION_MAX_TURNS` turnos (por defecto **6**; un turno es un par user+assistant): al superarse, se descartan los pares más antiguos para acotar el coste en tokens. El system prompt **no** entra en la ventana: es invariante y se **regenera** en cada llamada a partir del `project_metadata` actual, así que nunca queda obsoleto aunque la conversación crezca.
 
 Esa memoria se actualiza **después de cada respuesta** mediante una **segunda llamada al LLM**: un prompt específico que recibe la interacción (transcripción + estimación generada) y devuelve un JSON con los campos de `ProjectMetadata`, que se funde sobre los hechos previos (los escalares nuevos ganan, las listas se unen, lo desconocido no se pisa).
 

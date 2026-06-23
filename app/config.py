@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     cache_enabled: bool = True
     cache_ttl_seconds: int = 86400  # 24h
 
+    # Memoria de sesión: tamaño de la ventana deslizante en turnos (un turno = un
+    # par user+assistant). Al superarse, se descartan los pares más antiguos.
+    session_max_turns: int = 6
+
     # Observabilidad (structlog). `log_json=true` fuerza salida JSON aunque haya
     # TTY; por defecto se decide según haya o no terminal adjunto.
     log_level: str = "INFO"

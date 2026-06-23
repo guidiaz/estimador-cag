@@ -130,15 +130,14 @@ async def create_session_estimate(
 
     user_content = _build_session_user_content(transcript, extracted)
 
-    # System prompt de sesión: incluye el bloque <project_metadata> con los hechos
-    # conocidos (vacío en la primera llamada). Se re-renderiza cada turno con la
-    # metadata actualizada del turno anterior.
-    #
-    # Hilo para la llamada = system + turnos previos + el nuevo user. No mutamos la
-    # sesión hasta que la generación tiene éxito: así un 502 no deja un turno de
-    # usuario huérfano (sin respuesta) en la memoria.
-    session.history.set_system(render_session_system_prompt(session.metadata))
-    thread = session.history.messages() + [{"role": "user", "content": user_content}]
+    # Hilo para la llamada: el system prompt se regenera ahora a partir del
+    # project_metadata actual (incluye el bloque <project_metadata> con los hechos
+    # conocidos, vacío en la primera llamada) y `to_messages_list` lo antepone a la
+    # ventana de turnos + el nuevo user. No mutamos la sesión hasta que la
+    # generación tiene éxito: así un 502 no deja un turno de usuario huérfano.
+    thread = session.history.to_messages_list(
+        render_session_system_prompt(session.metadata), pending_user=user_content
+    )
 
     try:
         # litellm es síncrono: al threadpool para no bloquear el event loop durante

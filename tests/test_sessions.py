@@ -1,27 +1,38 @@
-"""Tests del recorte por turnos de `ConversationHistory` (`app.services.sessions`).
+"""Tests de la ventana deslizante de `ConversationHistory` (`app.services.sessions`).
 
-El foco es la ventana deslizante: un *turno* es un intercambio que abre cada
-mensaje `user`, y al superar `max_turns` se descartan los turnos más antiguos.
-Los invariantes que se protegen aquí son los frágiles: (1) el system prompt nunca
-caduca y siempre encabeza el hilo; (2) el recorte razona en turnos, así que jamás
-separa un `assistant` de su `user`; (3) un `user` aún sin respuesta cuenta como el
-turno en curso y no se recorta. Son tests puramente locales: no tocan el modelo.
+El foco es el recorte por turnos (un turno = un par `user`+`assistant`) y el
+contrato de `to_messages_list`. Invariantes protegidos: (1) el system prompt
+siempre encabeza la salida pero NO se almacena (se regenera por llamada); (2) el
+recorte razona en pares, así que jamás separa un `assistant` de su `user` ni deja
+la ventana empezando por un `assistant` huérfano; (3) un `user` sin respuesta es
+el turno en curso y no se recorta; (4) `pending_user` no muta el historial. Son
+tests puramente locales: no tocan el modelo.
 """
 
 import pytest
 
-from app.services.sessions import ConversationHistory
+from app.config import settings
+from app.services.sessions import MAX_TURNS, ConversationHistory
+
+SYS = "SYS"
 
 
-def _roles(history: ConversationHistory) -> list[str]:
-    return [m["role"] for m in history.messages()]
+def _window(history: ConversationHistory) -> list[dict]:
+    """Mensajes de la ventana (la salida sin el system regenerado de cabeza)."""
+    return history.to_messages_list(SYS)[1:]
 
 
-def _contents(history: ConversationHistory) -> list[str]:
-    return [m["content"] for m in history.messages()]
+def _window_contents(history: ConversationHistory) -> list[str]:
+    return [m["content"] for m in _window(history)]
 
 
-# --- construcción / validación ------------------------------------------------
+def _fill_turns(history: ConversationHistory, n: int) -> None:
+    for i in range(n):
+        history.add("user", f"u{i}")
+        history.add("assistant", f"a{i}")
+
+
+# --- construcción / configuración ---------------------------------------------
 
 
 def test_max_turns_invalido_lanza_value_error():
@@ -29,72 +40,86 @@ def test_max_turns_invalido_lanza_value_error():
         ConversationHistory(max_turns=0)
 
 
-# --- el system prompt se preserva ---------------------------------------------
+def test_max_turns_por_defecto_es_6():
+    # El valor por defecto especificado es 6 (ajustable con SESSION_MAX_TURNS, que
+    # en el entorno de tests no se sobreescribe).
+    assert settings.session_max_turns == 6
+    assert MAX_TURNS == 6
+    # ConversationHistory toma ese default sin que haya que pasarlo.
+    assert ConversationHistory().max_turns == 6
 
 
-def test_system_prompt_encabeza_y_queda_fuera_de_la_ventana():
+# --- to_messages_list: el system es invariante pero no se almacena -------------
+
+
+def test_to_messages_list_antepone_siempre_el_system():
     h = ConversationHistory(max_turns=2)
-    h.set_system("SYS")
-    for i in range(5):
-        h.add("user", f"u{i}")
-        h.add("assistant", f"a{i}")
+    _fill_turns(h, 3)
 
-    msgs = h.messages()
-    assert msgs[0] == {"role": "system", "content": "SYS"}
+    msgs = h.to_messages_list(SYS)
+    assert msgs[0] == {"role": "system", "content": SYS}
     # El system no cuenta como turno ni ocupa hueco de la ventana.
     assert h.turn_count() == 2
     assert len(h) == 4  # 2 turnos * (user + assistant)
 
 
-def test_set_system_reemplaza_sin_duplicar_y_no_afecta_a_la_ventana():
-    h = ConversationHistory(max_turns=3)
-    h.set_system("SYS-1")
-    h.add("user", "u0")
-    h.set_system("SYS-2")
-
-    msgs = h.messages()
-    assert msgs[0] == {"role": "system", "content": "SYS-2"}
-    assert _roles(h).count("system") == 1
-    assert len(h) == 1
+def test_historial_vacio_solo_devuelve_el_system():
+    h = ConversationHistory()
+    assert h.to_messages_list(SYS) == [{"role": "system", "content": SYS}]
 
 
-def test_add_con_rol_system_equivale_a_set_system():
-    h = ConversationHistory(max_turns=2)
-    h.add("system", "SYS")
-    h.add("user", "u0")
-
-    assert h.messages()[0] == {"role": "system", "content": "SYS"}
-    assert h.turn_count() == 1  # el system no abre turno
-
-
-def test_sin_system_prompt_solo_devuelve_la_ventana():
-    h = ConversationHistory(max_turns=2)
+def test_el_system_se_regenera_en_cada_llamada_no_se_almacena():
+    h = ConversationHistory()
     h.add("user", "u0")
     h.add("assistant", "a0")
 
-    assert _roles(h) == ["user", "assistant"]
+    # Dos llamadas con system distinto reflejan cada una el valor que se les pasa:
+    # no hay system «pegado» de una llamada anterior.
+    assert h.to_messages_list("SYS-1")[0]["content"] == "SYS-1"
+    assert h.to_messages_list("SYS-2")[0]["content"] == "SYS-2"
 
 
-# --- recorte por turnos -------------------------------------------------------
+def test_add_con_rol_system_lanza_value_error():
+    h = ConversationHistory()
+    with pytest.raises(ValueError):
+        h.add("system", "SYS")
+
+
+# --- pending_user: completa la lista sin mutar el historial -------------------
+
+
+def test_pending_user_se_anade_al_final_sin_mutar_el_historial():
+    h = ConversationHistory()
+    h.add("user", "u0")
+    h.add("assistant", "a0")
+
+    msgs = h.to_messages_list(SYS, pending_user="u1")
+    assert msgs == [
+        {"role": "system", "content": SYS},
+        {"role": "user", "content": "u0"},
+        {"role": "assistant", "content": "a0"},
+        {"role": "user", "content": "u1"},
+    ]
+    # El turno pendiente no se persiste: el historial sigue con un solo turno.
+    assert h.turn_count() == 1
+    assert len(h) == 2
+
+
+# --- recorte por turnos (pares) -----------------------------------------------
 
 
 def test_recorta_conservando_los_n_turnos_mas_recientes():
     h = ConversationHistory(max_turns=3)
-    h.set_system("SYS")
-    for i in range(5):
-        h.add("user", f"u{i}")
-        h.add("assistant", f"a{i}")
+    _fill_turns(h, 5)
 
-    # Se quedan los turnos 2, 3 y 4; se descartan 0 y 1.
-    assert _contents(h) == ["SYS", "u2", "a2", "u3", "a3", "u4", "a4"]
+    # Se quedan los turnos 2, 3 y 4; se descartan los pares 0 y 1.
+    assert _window_contents(h) == ["u2", "a2", "u3", "a3", "u4", "a4"]
     assert h.turn_count() == 3
 
 
 def test_bajo_el_limite_no_recorta():
     h = ConversationHistory(max_turns=5)
-    for i in range(3):
-        h.add("user", f"u{i}")
-        h.add("assistant", f"a{i}")
+    _fill_turns(h, 3)
 
     assert h.turn_count() == 3
     assert len(h) == 6
@@ -102,25 +127,19 @@ def test_bajo_el_limite_no_recorta():
 
 def test_exactamente_en_el_limite_no_recorta():
     h = ConversationHistory(max_turns=3)
-    for i in range(3):
-        h.add("user", f"u{i}")
-        h.add("assistant", f"a{i}")
+    _fill_turns(h, 3)
 
-    assert _contents(h) == ["u0", "a0", "u1", "a1", "u2", "a2"]
+    assert _window_contents(h) == ["u0", "a0", "u1", "a1", "u2", "a2"]
 
 
 def test_el_recorte_nunca_separa_assistant_de_su_user():
     h = ConversationHistory(max_turns=2)
-    for i in range(4):
-        h.add("user", f"u{i}")
-        h.add("assistant", f"a{i}")
+    _fill_turns(h, 4)
 
-    # Cada turno conservado mantiene su par completo; ningún `assistant` queda
-    # huérfano a la cabeza de la ventana.
-    msgs = h.messages()
-    assert msgs[0]["role"] == "user"
-    pares = list(zip(msgs[::2], msgs[1::2]))
-    for u, a in pares:
+    win = _window(h)
+    # La ventana empieza por `user` y cada par queda completo y emparejado.
+    assert win[0]["role"] == "user"
+    for u, a in zip(win[::2], win[1::2]):
         assert u["role"] == "user"
         assert a["role"] == "assistant"
         assert u["content"][1:] == a["content"][1:]  # u3<->a3, u2<->a2
@@ -131,15 +150,13 @@ def test_el_recorte_nunca_separa_assistant_de_su_user():
 
 def test_user_sin_respuesta_es_el_turno_en_curso_y_no_se_recorta():
     h = ConversationHistory(max_turns=3)
-    for i in range(3):
-        h.add("user", f"u{i}")
-        h.add("assistant", f"a{i}")
+    _fill_turns(h, 3)
     h.add("user", "u3")  # turno 4 abierto, aún sin assistant
 
     # Abrir el 4º turno expulsa al más antiguo (turno 0) y deja u3 intacto al final.
     assert h.turn_count() == 3
-    assert _contents(h)[-1] == "u3"
-    assert "u0" not in _contents(h)
+    assert _window_contents(h)[-1] == "u3"
+    assert "u0" not in _window_contents(h)
 
 
 def test_dos_users_seguidos_cuentan_como_dos_turnos():
@@ -149,7 +166,7 @@ def test_dos_users_seguidos_cuentan_como_dos_turnos():
 
     # Cada `user` abre turno; con max_turns=1 solo sobrevive el último.
     assert h.turn_count() == 1
-    assert _contents(h) == ["u1"]
+    assert _window_contents(h) == ["u1"]
 
 
 def test_assistant_inicial_suelto_no_abre_turno_y_se_descarta_al_recortar():
@@ -163,5 +180,5 @@ def test_assistant_inicial_suelto_no_abre_turno_y_se_descarta_al_recortar():
     # El segundo turno expulsa al primero, y al cortar en el `user` superviviente
     # el assistant suelto de cabeza desaparece con lo anterior.
     assert h.turn_count() == 1
-    assert "a-suelto" not in _contents(h)
-    assert _contents(h) == ["u1", "a1"]
+    assert "a-suelto" not in _window_contents(h)
+    assert _window_contents(h) == ["u1", "a1"]
