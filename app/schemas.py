@@ -113,6 +113,30 @@ class SessionResponse(BaseModel):
     session_id: str
 
 
+class AttachmentInfo(BaseModel):
+    """Resumen (sin contenido) de un adjunto procesado, como acuse para el cliente."""
+
+    filename: str
+    extracted_chars: int = Field(
+        description="Caracteres de texto extraídos del documento (0 si no tenía texto)"
+    )
+
+
+class SessionEstimationResponse(BaseModel):
+    """Respuesta de `POST /sessions/{id}/estimate` (path conversacional con CAG).
+
+    No lleva `prompt_version` (este path usa el system prompt CAG, no las plantillas
+    Jinja versionadas); sí el proveedor/modelo/uso, como la respuesta heredada.
+    `attachments` confirma qué documentos se ingirieron y cuánto texto aportó cada
+    uno (metadato, nunca el contenido). Snake_case en el wire."""
+
+    text: str
+    model: str
+    provider: str
+    used_tokens: int
+    attachments: list[AttachmentInfo] = Field(default_factory=list)
+
+
 # --- Contrato heredado: endpoint de streaming `POST /estimate/stream` ---
 
 

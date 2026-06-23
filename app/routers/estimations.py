@@ -2,21 +2,26 @@ import json
 import uuid
 
 import structlog
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 
 from app.config import settings
 from app.context.examples import ESTIMATION_EXAMPLES
 from app.schemas import (
+    AttachmentInfo,
     EstimateRequest,
     EstimationRequest,
     EstimationResponse,
+    SessionEstimationResponse,
     SessionResponse,
 )
+from app.services import documents
 from app.services.llm_service import (
     PROMPT_VERSION,
     build_system_prompt,
     generate_estimation,
+    generate_from_messages,
     stream_estimation,
 )
 from app.services.sessions import sessions
@@ -39,6 +44,128 @@ def create_session() -> SessionResponse:
     sessions.get_or_create(session_id)
     logger.info("session.created", session_id=session_id, active_sessions=len(sessions))
     return SessionResponse(session_id=session_id)
+
+
+def _build_session_user_content(
+    transcript: str, extracted: list[tuple[str, str]]
+) -> str:
+    """Compone el mensaje de usuario: transcripción + documentación adjunta.
+
+    Etiqueta cada adjunto con su nombre bajo una sección propia para que el modelo
+    distinga la transcripción de la documentación complementaria."""
+    sections = [transcript.strip()]
+    if extracted:
+        sections.append("## Documentación adjunta")
+        for filename, text in extracted:
+            sections.append(f"### {filename}\n\n{text}")
+    return "\n\n".join(sections)
+
+
+@router.post(
+    "/sessions/{session_id}/estimate", response_model=SessionEstimationResponse
+)
+async def create_session_estimate(
+    session_id: str,
+    transcript: str = Form(
+        ...,
+        min_length=1,
+        description="Texto de la transcripción de la reunión",
+    ),
+    attachments: list[UploadFile] = File(
+        default=[],
+        description="Documentación complementaria opcional (PDF o Word .docx)",
+    ),
+) -> SessionEstimationResponse:
+    """Genera una estimación en el contexto de una sesión, con adjuntos opcionales.
+
+    Acepta `multipart/form-data`: `transcript` (texto) y `attachments` (lista
+    opcional de PDF/Word). De cada adjunto se extrae **texto plano en el backend**
+    (ver `app/services/documents.py`) —no se usa la Files API del proveedor— y se
+    añade etiquetado al mensaje de usuario. La estimación se genera viendo el hilo
+    completo de la sesión (memoria multi-turno) y el nuevo turno se persiste en ella.
+
+    Errores: 404 si la sesión no existe (el almacén es volátil; ver POST /sessions),
+    400 si un adjunto no es soportado/está corrupto o se exceden los límites, 502 si
+    falla el proveedor.
+    """
+    session = sessions.get(session_id)
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Sesión no encontrada. Crea una con POST /sessions.",
+        )
+
+    if len(attachments) > documents.MAX_ATTACHMENTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Máximo {documents.MAX_ATTACHMENTS} adjuntos por petición.",
+        )
+
+    extracted: list[tuple[str, str]] = []  # (filename, texto) de los que aportan texto
+    infos: list[AttachmentInfo] = []
+    for file in attachments:
+        filename = file.filename or "adjunto"
+        # Rechazamos por tamaño ANTES de leer los bytes a memoria: así un adjunto
+        # enorme no llega siquiera a cargarse en el worker (`file.size` lo aporta
+        # Starlette desde el multipart).
+        if file.size is not None and file.size > documents.MAX_FILE_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"El archivo {filename!r} supera el máximo de "
+                    f"{documents.MAX_FILE_BYTES // (1024 * 1024)} MB"
+                ),
+            )
+        data = await file.read()
+        try:
+            # pypdf/python-docx son síncronos: a un threadpool para no bloquear el loop.
+            text = await run_in_threadpool(documents.extract_text, filename, data)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        infos.append(AttachmentInfo(filename=filename, extracted_chars=len(text)))
+        if text:
+            extracted.append((filename, text))
+
+    user_content = _build_session_user_content(transcript, extracted)
+
+    # Hilo para la llamada = system (CAG) + turnos previos + el nuevo user. No mutamos
+    # la sesión hasta que la generación tiene éxito: así un 502 no deja un turno de
+    # usuario huérfano (sin respuesta) en la memoria.
+    session.history.set_system(build_system_prompt())
+    thread = session.history.messages() + [{"role": "user", "content": user_content}]
+
+    try:
+        # litellm es síncrono: al threadpool para no bloquear el event loop durante
+        # el round-trip al proveedor (segundos), que es la operación más larga aquí.
+        result = await run_in_threadpool(generate_from_messages, thread)
+    except Exception as exc:  # noqa: BLE001 - cualquier fallo del proveedor → 502
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error al generar la estimación: {exc}",
+        ) from exc
+
+    session.history.add("user", user_content)
+    session.history.add("assistant", result.estimation)
+
+    logger.info(
+        "session.estimate.completed",
+        session_id=session_id,
+        attachment_count=len(attachments),
+        turns=session.history.turn_count(),
+        model=result.model,
+        provider=result.provider,
+        used_tokens=result.used_tokens,
+        transcript_chars=len(transcript),
+        extracted_chars=sum(i.extracted_chars for i in infos),
+    )
+
+    return SessionEstimationResponse(
+        text=result.estimation,
+        model=result.model,
+        provider=result.provider,
+        used_tokens=result.used_tokens,
+        attachments=infos,
+    )
 
 
 @router.post("/estimate", response_model=EstimationResponse)

@@ -6,6 +6,7 @@ API REST que genera estimaciones de proyectos de software a partir de la descrip
 
 - `POST /api/v1/estimate` (bloqueante): recibe una **petición estructurada** (descripción + tipo de proyecto, nivel de detalle y formato de salida) y devuelve la estimación como texto libre más la versión del prompt que la generó.
 - `POST /api/v1/estimate/stream` (streaming NDJSON, token a token): opera sobre una transcripción libre.
+- **Sesiones con memoria conversacional**: `POST /api/v1/sessions` crea una sesión y `POST /api/v1/sessions/{session_id}/estimate` genera estimaciones **multi-turno** sobre ella, con **documentación adjunta opcional** (PDF / Word `.docx`) de la que se extrae texto plano en el backend.
 - Soporte para **Anthropic** (por defecto) y **OpenAI** (fallback) mediante un router de LiteLLM.
 - Contexto fijo con ejemplos reales (inventario, app móvil, portal B2B, microservicios, etc.) en `app/context/examples.py`.
 - Cache opcional en Redis y logging estructurado (structlog) con correlación de peticiones.
@@ -133,6 +134,54 @@ Una petición con campos inválidos (descripción corta, enum desconocido) se re
 
 > El endpoint de streaming `POST /api/v1/estimate/stream` mantiene el contrato heredado basado en `transcription` (devuelve NDJSON token a token).
 
+### Sesiones con memoria y documentación adjunta
+
+Para estimar de forma **conversacional** (varios turnos sobre el mismo contexto) y aportar documentación complementaria, primero se crea una sesión:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/sessions
+# {"session_id": "8938f4e4-975f-4f99-9c6b-58e839dc2a46"}
+```
+
+El cliente guarda ese `session_id` (UUID v4) y lo reenvía en cada petición posterior para reutilizar la memoria entre páginas. Luego se solicita la estimación con `multipart/form-data`:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/sessions/<session_id>/estimate \
+  -F "transcript=El cliente necesita un panel interno de KPIs con login SSO." \
+  -F "attachments=@requisitos.pdf" \
+  -F "attachments=@alcance.docx"
+```
+
+- `transcript` (texto, requerido): la transcripción de la reunión.
+- `attachments` (lista opcional de ficheros): documentación complementaria en **PDF** o **Word `.docx`**.
+
+**Response** (`SessionEstimationResponse`):
+
+```json
+{
+  "text": "## Estimación: ...",
+  "model": "anthropic/claude-haiku-4-5",
+  "provider": "anthropic",
+  "used_tokens": 1234,
+  "attachments": [
+    {"filename": "requisitos.pdf", "extracted_chars": 4096},
+    {"filename": "alcance.docx", "extracted_chars": 1820}
+  ]
+}
+```
+
+La estimación se genera viendo el **hilo completo** de la sesión (la memoria multi-turno) y el nuevo turno se persiste en ella. Errores: **404** si la sesión no existe (el almacén de sesiones es **volátil** —vive en memoria del proceso—, así que tras un reinicio los `session_id` previos dejan de ser válidos; es un compromiso asumido en esta fase), **400** si un adjunto no es soportado/está corrupto o se exceden los límites (máx. 8 adjuntos, 10 MB por archivo), **502** si falla el proveedor.
+
+#### Por qué la documentación se procesa en backend (texto plano)
+
+De los adjuntos **extraemos el texto plano nosotros** (`pypdf` para PDF, `python-docx` para Word), **sin** subir los ficheros a la *Files API* de OpenAI/Anthropic. Los motivos:
+
+- **Independencia del proveedor.** El texto extraído se inyecta como un mensaje más del prompt, así que funciona igual sea cual sea el modelo configurado y el fallback Anthropic↔OpenAI no depende de que ambos soporten el mismo formato binario ni la misma API de archivos.
+- **Control para el RAG futuro.** Tener el texto plano en el backend es el punto de partida natural para el *chunking* y la indexación de un RAG más adelante: troceamos, embebemos e indexamos sobre texto que ya controlamos, sin reextraer ni depender de un almacén de archivos remoto.
+- **Coste y trazabilidad.** Evita reenviar el binario completo en cada turno y permite medir/registrar cuánto texto aportó cada adjunto (solo metadatos: nombre y nº de caracteres, **nunca** el contenido).
+
+Solo se admiten formatos con capa de texto. Un PDF escaneado (solo imagen) extrae texto vacío y se ignora ese adjunto; el `.doc` binario antiguo no se soporta (sí el `.docx` moderno).
+
 ## Cómo funciona (CAG)
 
 ```
@@ -183,13 +232,15 @@ estimador-cag/
 │   ├── config.py            # Settings desde .env
 │   ├── logging_config.py    # Configuración de structlog
 │   ├── middleware.py        # request_id + access log (ASGI)
-│   ├── schemas.py           # Contrato Pydantic (EstimationRequest/Response + legacy)
+│   ├── schemas.py           # Contrato Pydantic (EstimationRequest/Response + sesiones + legacy)
 │   ├── context/
 │   │   └── examples.py      # Ejemplos CAG
 │   ├── routers/
-│   │   └── estimations.py   # POST /estimate, /estimate/stream, GET /context
+│   │   └── estimations.py   # POST /estimate, /estimate/stream, /sessions, /sessions/{id}/estimate, GET /context
 │   └── services/
 │       ├── llm_service.py   # Router LiteLLM (Anthropic/OpenAI) + prompts
+│       ├── sessions.py      # Memoria de sesión en memoria (hilo + metadatos), volátil
+│       ├── documents.py     # Extracción de texto plano de adjuntos (pypdf / python-docx)
 │       └── cache.py         # Cache Redis con degradación elegante
 ├── streamlit_app.py         # UI (formulario) — proceso aparte
 ├── api_client.py            # Cliente HTTP fino de la API
@@ -203,7 +254,8 @@ estimador-cag/
 | Código | Causa |
 |--------|--------|
 | `422` | La petición no cumple el contrato (descripción fuera de rango, enum desconocido, campo faltante) |
-| `400` | Error de negocio de validación dentro del servicio |
+| `400` | Error de negocio de validación dentro del servicio (incluye adjunto no soportado/corrupto o exceso de límites) |
+| `404` | La sesión indicada en `/sessions/{id}/estimate` no existe (el almacén de sesiones es volátil) |
 | `502` | Fallo al llamar al proveedor (API key, red, modelo, etc.) |
 
 ## Stack
@@ -213,6 +265,7 @@ estimador-cag/
 - [LiteLLM](https://docs.litellm.ai/) (router Anthropic / OpenAI)
 - [Streamlit](https://streamlit.io/) (UI)
 - [Redis](https://redis.io/) (cache opcional)
+- [pypdf](https://pypdf.readthedocs.io/) + [python-docx](https://python-docx.readthedocs.io/) (extracción de texto de adjuntos)
 - [structlog](https://www.structlog.org/) (logging estructurado)
 - [Pydantic Settings](https://docs.pydantic.dev/latest/concepts/pydantic_settings/)
 

@@ -137,17 +137,14 @@ def _get_router() -> Router:
     return _router
 
 
-def _complete(
-    system_prompt: str, transcription: str, max_tokens: int = 4096
+def _complete_messages(
+    messages: list[dict], max_tokens: int = 4096
 ) -> EstimationResult:
-    # anthropic vía litellm requiere `max_tokens`; lo fijamos aquí (este path no lo
-    # recibe del cliente).
+    # anthropic vía litellm requiere `max_tokens`; lo fijamos aquí (estos paths no lo
+    # reciben del cliente).
     response = _get_router().completion(
         model=_PRIMARY,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": transcription},
-        ],
+        messages=messages,
         max_tokens=max_tokens,
     )
     usage = getattr(response, "usage", None)
@@ -161,6 +158,33 @@ def _complete(
         provider=provider,
         used_tokens=used_tokens,
     )
+
+
+def _complete(
+    system_prompt: str, transcription: str, max_tokens: int = 4096
+) -> EstimationResult:
+    return _complete_messages(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": transcription},
+        ],
+        max_tokens=max_tokens,
+    )
+
+
+def generate_from_messages(
+    messages: list[dict], max_tokens: int = 4096
+) -> EstimationResult:
+    """Genera una estimación a partir de un hilo de mensajes ya construido.
+
+    Pensada para el path conversacional de sesión (`POST /sessions/{id}/estimate`):
+    el llamante pasa el hilo completo —`[system, ...turnos previos, user]`— para que
+    el modelo vea la memoria acumulada de la sesión. Usa el mismo Router (Anthropic
+    primario, OpenAI fallback) que el resto de paths. **No cachea**: el hilo crece
+    turno a turno, así que la tasa de aciertos sería marginal y la clave dependería
+    de toda la conversación.
+    """
+    return _complete_messages(messages, max_tokens=max_tokens)
 
 
 def _best_effort_tokens(captured: dict, messages: list, text: str) -> None:

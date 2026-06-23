@@ -1,0 +1,191 @@
+"""Tests del endpoint `POST /api/v1/sessions/{id}/estimate`.
+
+Cubren el contrato multipart (transcript + adjuntos) y el cableado con la sesión,
+con el LLM monkeypatcheado (no se llama al proveedor). Se verifica: 404 si la
+sesión no existe; happy path con adjunto Word (texto extraído e incorporado al
+hilo, turno persistido en la memoria, acuse `attachments`); errores de adjunto
+(tipo no soportado → 400, exceso de adjuntos → 400); y que un 502 del proveedor no
+deja un turno huérfano en la memoria de la sesión.
+"""
+
+import io
+
+import pytest
+from docx import Document
+from fastapi.testclient import TestClient
+
+from app.main import app
+from app.routers import estimations
+from app.services.llm_service import EstimationResult
+
+client = TestClient(app)
+
+
+def _make_docx(text: str) -> bytes:
+    doc = Document()
+    doc.add_paragraph(text)
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def _new_session() -> str:
+    return client.post("/api/v1/sessions").json()["session_id"]
+
+
+@pytest.fixture
+def fake_llm(monkeypatch):
+    """Sustituye `generate_from_messages` y captura el hilo que recibe."""
+    calls: list[list[dict]] = []
+
+    def _fake(messages, max_tokens=4096):
+        calls.append(messages)
+        return EstimationResult(
+            estimation="## Estimación\n\n40h",
+            model="anthropic/claude-haiku-4-5",
+            provider="anthropic",
+            used_tokens=123,
+        )
+
+    monkeypatch.setattr(estimations, "generate_from_messages", _fake)
+    return calls
+
+
+# --- 404 -----------------------------------------------------------------------
+
+
+def test_sesion_inexistente_devuelve_404(fake_llm):
+    resp = client.post(
+        "/api/v1/sessions/no-existe/estimate",
+        data={"transcript": "Reunión inicial sobre la app de reservas."},
+    )
+    assert resp.status_code == 404
+    assert fake_llm == []  # no se llega a llamar al modelo
+
+
+# --- happy path ----------------------------------------------------------------
+
+
+def test_estimacion_con_adjunto_docx(fake_llm):
+    session_id = _new_session()
+    docx = _make_docx("Requisito: panel de KPIs con SSO.")
+
+    resp = client.post(
+        f"/api/v1/sessions/{session_id}/estimate",
+        data={"transcript": "Resumen de la reunión con el cliente."},
+        files=[("attachments", ("reqs.docx", docx, "application/octet-stream"))],
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["text"] == "## Estimación\n\n40h"
+    assert body["provider"] == "anthropic"
+    assert body["used_tokens"] == 123
+    assert body["attachments"] == [
+        {"filename": "reqs.docx", "extracted_chars": len("Requisito: panel de KPIs con SSO.")}
+    ]
+
+    # El hilo enviado al modelo incluye el system (CAG) y el texto extraído del adjunto.
+    thread = fake_llm[0]
+    assert thread[0]["role"] == "system"
+    user_msg = thread[-1]["content"]
+    assert "Resumen de la reunión con el cliente." in user_msg
+    assert "Documentación adjunta" in user_msg
+    assert "Requisito: panel de KPIs con SSO." in user_msg
+
+
+def test_turno_se_persiste_en_la_memoria_de_la_sesion(fake_llm):
+    from app.services.sessions import sessions
+
+    session_id = _new_session()
+    client.post(
+        f"/api/v1/sessions/{session_id}/estimate",
+        data={"transcript": "Primera reunión."},
+    )
+
+    history = sessions.get(session_id).history
+    assert history.turn_count() == 1  # un intercambio user+assistant
+    roles = [m["role"] for m in history.messages()]
+    assert roles == ["system", "user", "assistant"]
+
+    # Un segundo turno se acumula sobre el primero (memoria multi-turno).
+    client.post(
+        f"/api/v1/sessions/{session_id}/estimate",
+        data={"transcript": "Segunda reunión, nuevos requisitos."},
+    )
+    history = sessions.get(session_id).history
+    assert history.turn_count() == 2
+
+
+def test_sin_adjuntos_funciona(fake_llm):
+    session_id = _new_session()
+    resp = client.post(
+        f"/api/v1/sessions/{session_id}/estimate",
+        data={"transcript": "Reunión sin documentación adjunta."},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["attachments"] == []
+
+
+# --- errores de adjunto --------------------------------------------------------
+
+
+def test_adjunto_no_soportado_devuelve_400(fake_llm):
+    session_id = _new_session()
+    resp = client.post(
+        f"/api/v1/sessions/{session_id}/estimate",
+        data={"transcript": "Reunión con un adjunto inválido."},
+        files=[("attachments", ("notas.txt", b"texto plano", "text/plain"))],
+    )
+    assert resp.status_code == 400
+    assert "no soportado" in resp.json()["detail"]
+
+
+def test_demasiados_adjuntos_devuelve_400(fake_llm):
+    from app.services.documents import MAX_ATTACHMENTS
+
+    session_id = _new_session()
+    docx = _make_docx("contenido")
+    files = [
+        ("attachments", (f"d{i}.docx", docx, "application/octet-stream"))
+        for i in range(MAX_ATTACHMENTS + 1)
+    ]
+    resp = client.post(
+        f"/api/v1/sessions/{session_id}/estimate",
+        data={"transcript": "Demasiados adjuntos."},
+        files=files,
+    )
+    assert resp.status_code == 400
+    assert "Máximo" in resp.json()["detail"]
+
+
+def test_transcript_vacio_devuelve_422(fake_llm):
+    session_id = _new_session()
+    resp = client.post(
+        f"/api/v1/sessions/{session_id}/estimate",
+        data={"transcript": ""},
+    )
+    assert resp.status_code == 422
+
+
+# --- fallo del proveedor -------------------------------------------------------
+
+
+def test_error_del_proveedor_no_deja_turno_huerfano(monkeypatch):
+    from app.services.sessions import sessions
+
+    def _boom(messages, max_tokens=4096):
+        raise RuntimeError("proveedor caído")
+
+    monkeypatch.setattr(estimations, "generate_from_messages", _boom)
+
+    session_id = _new_session()
+    resp = client.post(
+        f"/api/v1/sessions/{session_id}/estimate",
+        data={"transcript": "Reunión que fallará."},
+    )
+    assert resp.status_code == 502
+
+    # La memoria no debe contener un user sin respuesta: el turno no se persistió.
+    history = sessions.get(session_id).history
+    assert history.turn_count() == 0

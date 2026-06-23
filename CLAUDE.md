@@ -32,10 +32,13 @@ streamlit_app.py ──HTTP──> api_client.py ──> FastAPI (app/)
 app/main.py            FastAPI app, /health, mounts router under /api/v1
   ├─ logging_config.py   configure_logging(): structlog + stdlib bridge (called at import)
   ├─ middleware.py       RequestContextMiddleware: pure-ASGI request_id + access log
-  └─ routers/estimations.py   3 endpoints (see below); maps ValueError→400, else→502
+  └─ routers/estimations.py   5 endpoints (see below); maps ValueError→400, else→502
        └─ services/llm_service.py   prompt build + LiteLLM Router (retry→fallback)
             ├─ generate_estimation → _complete   blocking → EstimationResult (POST /estimate)
+            ├─ generate_from_messages → _complete_messages   blocking, full thread (POST /sessions/{id}/estimate)
             ├─ stream_estimation   → _stream      generator yielding deltas  (POST /estimate/stream)
+            ├─ services/sessions.py   in-memory session store (history + metadata), volatile by design
+            ├─ services/documents.py  plain-text extraction of attachments (pypdf / python-docx)
             ├─ prompts/loader.py     render_estimation_prompt → (system, user) from Jinja2 templates (/estimate)
             ├─ prompts/estimation/v1/  system.j2 / user.j2 / examples.j2 (few-shot)
             ├─ services/cache.py     Redis cache wrapping both (estimate:v2 / estimate-stream:v2)
@@ -44,7 +47,9 @@ app/main.py            FastAPI app, /health, mounts router under /api/v1
   └─ schemas.py          EstimationRequest/EstimationResponse (structured /estimate) + legacy EstimateRequest (stream)
 ```
 
-The three endpoints in `routers/estimations.py`: `POST /estimate` (blocking JSON; **structured** `EstimationRequest` → `EstimationResponse` `{text, prompt_version}`), `POST /estimate/stream` (NDJSON: `{"type":"delta"|"done"|"error", ...}` — once streaming starts the status is 200, so mid-stream errors are `error` records in the body, not HTTP codes; still on the **legacy** free-text `EstimateRequest`), and `GET /context` (static CAG data for the sidebar). The two endpoints intentionally use **different request contracts**: `/estimate` is the structured form contract; `/estimate/stream` keeps the transcription contract until/unless it's migrated. FastAPI rejects a malformed `EstimationRequest` (e.g. `description` < 20 chars, bad enum) with **422** before the router's try/except, so the `ValueError→400` path is for business errors raised inside the service.
+The five endpoints in `routers/estimations.py`: `POST /estimate` (blocking JSON; **structured** `EstimationRequest` → `EstimationResponse` `{text, prompt_version}`), `POST /estimate/stream` (NDJSON: `{"type":"delta"|"done"|"error", ...}` — once streaming starts the status is 200, so mid-stream errors are `error` records in the body, not HTTP codes; still on the **legacy** free-text `EstimateRequest`), `POST /sessions` (mints a volatile session, returns `{session_id}` UUID v4), `POST /sessions/{id}/estimate` (**multipart** `transcript` + optional `attachments` → conversational CAG estimate over the session thread; → `SessionEstimationResponse`), and `GET /context` (static CAG data for the sidebar). The endpoints intentionally use **different request contracts**: `/estimate` is the structured form contract; `/estimate/stream` keeps the transcription contract; `/sessions/{id}/estimate` is the multipart session contract. FastAPI rejects a malformed `EstimationRequest` (e.g. `description` < 20 chars, bad enum) with **422** before the router's try/except, so the `ValueError→400` path is for business errors raised inside the service.
+
+- **Session memory + attachments (`POST /sessions/{id}/estimate`).** Sessions live in `services/sessions.py` — an **in-memory `dict` (volatile by design, no DB/Redis in this phase)** of `Session` (a `ConversationHistory` sliding window that always keeps the system prompt + drops oldest *turns*, where a turn = one `user`+`assistant` exchange; plus a `ProjectMetadata` Pydantic model). Unknown `session_id` → **404** (consistent with the documented volatility: IDs break across restarts). Attachments (PDF via `pypdf`, Word `.docx` via `python-docx`) are extracted to **plain text in the backend** — deliberately **not** the provider Files API — so the path is provider-agnostic and ready for future RAG chunking; extraction failures (unsupported/corrupt/oversized, capped at 8 files × 10 MB) → **400**. The handler is `async def`, so every blocking call (file extraction *and* the sync litellm generation) is wrapped in `run_in_threadpool`. History is mutated (`add` user+assistant) **only after** generation succeeds, so a 502 leaves no orphan turn. This path uses the CAG system prompt (`build_system_prompt`), **not** the Jinja templates, and is **not cached** (the thread grows per turn).
 
 Key design points to know before editing:
 
