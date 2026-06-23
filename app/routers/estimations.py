@@ -1,4 +1,5 @@
 import json
+import uuid
 
 import structlog
 from fastapi import APIRouter, HTTPException, Query
@@ -10,6 +11,7 @@ from app.schemas import (
     EstimateRequest,
     EstimationRequest,
     EstimationResponse,
+    SessionResponse,
 )
 from app.services.llm_service import (
     PROMPT_VERSION,
@@ -17,10 +19,26 @@ from app.services.llm_service import (
     generate_estimation,
     stream_estimation,
 )
+from app.services.sessions import sessions
 
 router = APIRouter(tags=["estimations"])
 
 logger = structlog.get_logger("app.estimations")
+
+
+@router.post("/sessions", response_model=SessionResponse, status_code=201)
+def create_session() -> SessionResponse:
+    """Crea una sesión de memoria conversacional y devuelve su `session_id`.
+
+    El identificador es un UUID v4. El cliente lo conserva y lo reenvía en cada
+    petición posterior para reutilizar la memoria (hilo + metadatos del proyecto)
+    entre páginas. La sesión se materializa ya en el almacén en memoria del proceso
+    (volátil por diseño en esta fase, ver `app/services/sessions.py`).
+    """
+    session_id = str(uuid.uuid4())
+    sessions.get_or_create(session_id)
+    logger.info("session.created", session_id=session_id, active_sessions=len(sessions))
+    return SessionResponse(session_id=session_id)
 
 
 @router.post("/estimate", response_model=EstimationResponse)

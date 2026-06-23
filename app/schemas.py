@@ -103,6 +103,16 @@ class EstimationResponse(BaseModel):
     prompt_version: str
 
 
+class SessionResponse(BaseModel):
+    """Respuesta de `POST /sessions`: el identificador de la sesión recién creada.
+
+    El cliente guarda este `session_id` (UUID v4) y lo reenvía en cada petición
+    posterior para reutilizar la memoria conversacional entre páginas. Snake_case
+    en el wire, igual que `EstimationResponse`."""
+
+    session_id: str
+
+
 # --- Contrato heredado: endpoint de streaming `POST /estimate/stream` ---
 
 
